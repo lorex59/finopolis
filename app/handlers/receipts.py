@@ -40,20 +40,34 @@ async def handle_photo(msg: Message):
             "Пожалуйста, напишите /start в личку боту и завершите регистрацию."
         )
         return
-    # Пример шаблонного "ответа" LLM
+
+    photo = msg.photo[-1]
+    width = photo.width
+    height = photo.height
+    file_size = photo.file_size
+
+    info = (
+        f"Разрешение изображения: {width}x{height} px\n"
+        f"Размер файла: {file_size} байт"
+    )
+
     fake_llm_items = [
         {"name": "Молоко", "quantity": 2, "price": 89.99},
         {"name": "Хлеб", "quantity": 1, "price": 39.90},
         {"name": "Яблоки", "quantity": 1.5, "price": 120.00},
     ]
 
-    add_positions(fake_llm_items)  # сохраняем в "базу данных"
+    add_positions(fake_llm_items)
 
-    text = "✅ Позиции добавлены:\n" + "\n".join(
-        f"{item['name']} — {item['quantity']} x {item['price']}₽"
-        for item in fake_llm_items
+    text = (
+        info + "\n\n" + "✅ Позиции добавлены:\n" +
+        "\n".join(
+            f"{item['name']} — {item['quantity']} x {item['price']}₽"
+            for item in fake_llm_items
+        )
     )
     await msg.answer(text)
+
 
 
 @router.message(Command("show"))
