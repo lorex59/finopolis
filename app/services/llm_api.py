@@ -19,62 +19,81 @@ from config import settings
 
 # services/llm_api.py
 
+import os
 import io
-import json
 import base64
 import asyncio
-from openai import OpenAI
-from config import settings
+from typing import List
+from pydantic import BaseModel, Field, RootModel
 
-client = OpenAI(
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
+
+# 1) Модель структурированного ответа
+class Item(BaseModel):
+    name: str = Field(description="Название позиции")
+    quantity: float = Field(description="Количество (число)")
+    price: float = Field(description="Цена за единицу (число)")
+
+class ReceiptItems(RootModel[List[Item]]):
+    pass
+
+# 2) Инициализация LLM через OpenRouter (OpenAI-совместимый API)
+#    Храните ключ в переменной окружения OPENROUTER_API_KEY
+llm = ChatOpenAI(
+    model="qwen/qwen2.5-vl-72b-instruct:free",
+    api_key=os.environ.get("OPENROUTER_API_KEY"),
     base_url="https://openrouter.ai/api/v1",
-    api_key=settings.openrouter_api_key,
+    # При желании можно прокинуть служебные заголовки OpenRouter:
+    default_headers={
+        "HTTP-Referer": "http://localhost",   # опционально
+        "X-Title": "Receipt Parser",          # опционально
+    },
+    temperature=0,
 )
 
-async def extract_items_from_image(image_bin: io.BytesIO) -> list[dict]:
+
+# 3) Оборачиваем LLM, чтобы он ВОЗВРАЩАЛ строго список Item
+structured_llm = llm.with_structured_output(
+    ReceiptItems,
+    include_raw=True,
+    method="json_schema",   # важно: не function_calling
+)
+
+
+PROMPT = (
+    "Распознай этот чек и верни строго JSON массив объектов с полями "
+    "`name` (строка), `quantity` (число), `price` (число). Только JSON-массив, без комментариев."
+)
+
+async def extract_items_from_image(image_bin: io.BytesIO):
     """
-    Асинхронно отправляет изображение чека в OpenRouter через OpenAI SDK.
-    Возвращает список позиций вида:
-      [{'name': str, 'quantity': float, 'price': float}, ...]
+    Отправляет изображение чека и возвращает:
+      - список Item (Pydantic-модели)
+      - usage-метаданные (токены)
     """
-    # Подготовка base64-изображения
     image_bin.seek(0)
     b64_img = base64.b64encode(image_bin.read()).decode()
 
-    prompt = (
-        "Распознай этот чек и верни только JSON список:\n"
-        "[{\"name\": ..., \"quantity\": ..., \"price\": ...}, ...]\n"
-        "Ничего лишнего."
+    # Формируем мультимодальное сообщение:
+    # текст + блок с картинкой в формате OpenAI Chat Completions
+    msg = HumanMessage(
+        content=[
+            {"type": "text", "text": PROMPT},
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"},
+            },
+        ]
     )
 
-    def sync_request():
-        response = client.chat.completions.create(
-            model="openai/gpt-4o",
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-                {
-                    "role": "user",
-                    "content": {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{b64_img}"
-                        }
-                    },
-                }
-            ]
-        )
-        return response.choices[0].message.content
+    # Асинхронный вызов
+    ai_response = await structured_llm.ainvoke([msg])
 
-    # Выполняем синхронный запрос в отдельном потоке
-    content = await asyncio.to_thread(sync_request)  # рекомендуется вместо run_in_executor :contentReference[oaicite:2]{index=2}
+    items = ai_response["parsed"].root
+    usage = (ai_response["raw"].usage_metadata or {})  # input_tokens/output_tokens/total_tokens
 
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        return eval(content)
+    return items, usage
 
 
 

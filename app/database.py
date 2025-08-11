@@ -5,7 +5,7 @@
 from collections import defaultdict
 from typing import Any
 
-USERS: dict[int, dict[str, Any]] = {}                 # user_id → профиль
+USERS: dict[int, dict[str, Any]] = {688410426: {'full_name': 'danil', 'phone': '+79644324111', 'bank': 'Tinkoff'}}                 # user_id → профиль
 RECEIPTS: dict[str, dict[str, Any]] = defaultdict(dict)  # receipt_id → данные чека
 DEBTS: dict[str, dict[int, float]] = defaultdict(dict)    # receipt_id → user_id → сумма
 
