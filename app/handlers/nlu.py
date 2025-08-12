@@ -17,7 +17,7 @@ dp.include_router(nlu_router).
 from aiogram import Router, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
-from services.llm_api import classify_message
+from services.llm_api import classify_message, classify_intent_llm
 from database import (
     get_positions,
     start_text_session,
@@ -35,34 +35,37 @@ nlu_router = Router(name="nlu")
 @nlu_router.message()
 async def handle_nlu_message(msg: Message):
     """
-    Entry point for natural language interaction. This handler runs
-    after all command and callback handlers. It uses the current
-    session state to either collect text for a calculation or to
-    interpret the message as a new command. If an unknown command is
-    detected a brief help message is returned.
+    Точка входа для обработки свободного текста. Этот обработчик
+    выполняется после всех команд и коллбэков. Сначала он проверяет,
+    собираем ли мы сообщения для текстового расчёта. Если да, то
+    добавляет сообщение в коллекцию или завершает сбор. В противном
+    случае классифицирует запрос с помощью LLM и выполняет
+    соответствующее действие.
     """
     chat_id = str(msg.chat.id)
     text = msg.text or ""
     session = TEXT_SESSIONS.get(chat_id)
-    # If we are currently collecting messages for a text calculation, handle accordingly
+
+    # --- Сбор сообщений для текстового сценария ---
     if session and session.get("collecting"):
         lowered = text.lower()
-        # Finish the text session if the user says it's done
+        # Пользователь завершает ввод
         if any(word in lowered for word in ["закончен", "закончена", "завершил", "готово", "конец"]):
             messages = end_text_session(chat_id)
-            # Messages collected: trigger finalization
             await msg.answer("✅ Текстовый сбор сообщений завершён. Начинаю расчёт...")
-            # We reuse the same /finalize handler to compute debts
-            # by artificially calling finalize_receipt
+            # Вызываем /finalize как будто это команда
             await finalize_receipt(msg)
         else:
             append_text_message(chat_id, text)
             await msg.answer("Сообщение учтено. Когда закончите, напишите 'расчёт закончен'.")
         return
 
-    # Otherwise classify the message
-    intent = classify_message(text)
-    # Greeting intent
+    # --- Классификация запроса ---
+    # Используем LLM для определения намерения. Этот вызов может
+    # завершиться эвристикой, если LLM недоступен.
+    intent = await classify_intent_llm(text)
+
+    # --- Реакции на намерения ---
     if intent == "greet":
         user = get_user(msg.from_user.id)
         if user is None:
@@ -72,21 +75,24 @@ async def handle_nlu_message(msg: Message):
             )
         else:
             await msg.answer(
-                f"Привет, {user.get('full_name', 'друг')}! Я — Разделятор. Могу помочь вам разделить покупки.\nДобавьте меня в группу, чтобы делить чеки с друзьями."
+                f"Привет, {user.get('full_name', 'друг')}! Я — Разделятор. Могу помочь вам разделить покупки.\n"
+                "Добавьте меня в группу, чтобы делить чеки с друзьями."
             )
         return
-    # List positions
+
     if intent == "list_positions":
         positions = get_positions()
         if not positions:
             await msg.answer("Нет позиций! Сначала добавьте чек.")
             return
-        text_lines = [f"{idx+1}. {i['name']} — {i['quantity']} x {i['price']}₽" for idx, i in enumerate(positions)]
+        text_lines = [
+            f"{idx+1}. {i['name']} — {i['quantity']} x {i['price']}₽" for idx, i in enumerate(positions)
+        ]
         await msg.answer("\n".join(text_lines))
         return
-    # Calculate debts
+
     if intent == "calculate":
-        # Ask the user whether they want to use the mini app or text input
+        # Предложить пользователю выбрать способ расчёта: мини‑приложение или текст
         kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
         kb.add(KeyboardButton(text="Мини-приложение"))
         kb.add(KeyboardButton(text="Текстовый ввод"))
@@ -94,16 +100,33 @@ async def handle_nlu_message(msg: Message):
             "Как будем считать расходы? Выберите:\n- \U0001F4D1 Мини-приложение\n- \U0001F4D1 Текстовый ввод",
             reply_markup=kb,
         )
-        # Next message from this user will determine the mode
-        # We'll use the TEXT_SESSIONS dict to flag the next step
-        # When user picks text mode we start collecting
-        # We store the choice as part of the session
+        # Помечаем, что ждём выбора пользователя
         TEXT_SESSIONS[chat_id] = {"collecting": False, "messages": [], "await_choice": True}
         return
-    # Help
+
+    if intent == "delete_position":
+        # Пока что не реализуем автоматическое удаление через естественный язык.
+        # Просим пользователя воспользоваться командой /show и кнопками для удаления.
+        await msg.answer(
+            "Чтобы удалить позицию, отправьте /show и нажмите соответствующую кнопку ✖️ рядом с нужной позицией."
+        )
+        return
+
+    if intent == "edit_position":
+        # Аналогично, редактирование через НЛУ не поддержано. Предлагаем использовать кнопки.
+        await msg.answer(
+            "Чтобы изменить позицию или добавить новую, отправьте /show и воспользуйтесь кнопками '✏️' для редактирования и '➕' для добавления."
+        )
+        return
+
+    if intent == "finalize":
+        # Пользователь просит завершить расчёт
+        await finalize_receipt(msg)
+        return
+
     if intent == "help":
         await msg.answer(
-            "Я могу помочь распределять расходы по чеку. Отправьте фото чека, \n"
+            "Я могу помочь распределять расходы по чеку. Отправьте фото чека,\n"
             "нажмите кнопку мини‑приложения для выбора позиций или воспользуйтесь текстовым вводом.\n"
             "Доступные команды:\n"
             "/start — регистрация\n"
@@ -111,19 +134,17 @@ async def handle_nlu_message(msg: Message):
             "/finalize — завершить расчёт и разделить расходы."
         )
         return
-    # Unknown intent: maybe this is a reply to a choice prompt
+
+    # --- Обработка выбора режима расчёта ---
     session_flags = TEXT_SESSIONS.get(chat_id, {})
     if session_flags.get("await_choice"):
-        # Determine if user chose mini or text
         lowered = text.lower()
         if "мини" in lowered:
-            # instruct user to press the webapp button
             await msg.answer(
                 "Пожалуйста, нажмите кнопку \U0001F4DD ‘Разделить чек’ в предыдущем сообщении, чтобы выбрать позиции в мини‑приложении.",
                 reply_markup=ReplyKeyboardRemove(),
             )
         elif "текст" in lowered:
-            # begin text session
             start_text_session(chat_id)
             await msg.answer(
                 "Отлично! Теперь по одному сообщению перечисляйте, кто и что ел.\n"
@@ -135,10 +156,10 @@ async def handle_nlu_message(msg: Message):
             await msg.answer(
                 "Не понял выбор. Пожалуйста, выберите ‘Мини-приложение’ или ‘Текстовый ввод’."
             )
-        # remove await_choice flag
         session_flags["await_choice"] = False
         return
-    # Fallback response
+
+    # --- Неизвестный запрос ---
     await msg.answer(
         "Извините, я не понимаю. Напишите /help, чтобы узнать, что я умею."
     )

@@ -127,34 +127,124 @@ async def calculate_debts_from_messages(items: dict[str, float], messages: list[
 
 
 # --- NLU functions ---
-def classify_message(text: str) -> str:
+
+# Дополнительная модель для текстовых классификаций.
+# Мы создаём отдельный экземпляр ChatOpenAI для обработки текстовых запросов.
+# При инициализации мы используем тот же API‑ключ и базовый URL, что и для
+# визуально‑текстовой модели выше. Если переменная окружения OPENROUTER_API_KEY
+# отсутствует, вызов LLM будет завершаться ошибкой. В таком случае можно
+# переопределить окружение или настроить fallback в вызывающем коде.
+try:
+    from langchain_openai import ChatOpenAI as _ChatOpenAI
+    _text_llm = _ChatOpenAI(
+        model="qwen/qwen2.5-vl-72b-instruct:free",
+        api_key=os.environ.get("OPENROUTER_API_KEY"),
+        base_url="https://openrouter.ai/api/v1",
+        temperature=0,
+    )
+except Exception:
+    _text_llm = None  # LLM недоступен; fallback будет выполнен ниже
+
+
+async def classify_intent_llm(text: str) -> str:
     """
-    Very simple classifier of user messages into high‑level intents.
+    Классифицирует входящее сообщение при помощи модели Qwen.
 
-    This function does not call any external LLM; instead it uses
-    heuristics based on keywords. In a real implementation you might
-    connect to an LLM (e.g. qwen via OpenRouter) and ask it to
-    categorize the incoming message. Keep this logic in one place so
-    that switching to a model later is straightforward.
+    Модель должна вернуть одну из следующих меток:
 
-    Returns one of the following labels:
       - greet: приветствие
       - list_positions: запрос списка позиций
       - calculate: запрос на расчёт долга
+      - delete_position: запрос на удаление позиции
+      - edit_position: запрос на изменение позиции
+      - finalize: запрос на завершение расчёта
       - help: запрос на помощь
-      - unknown: нераспознанная команда
+      - unknown: иное
+
+    Если модель недоступна, используется простая эвристическая классификация.
+    """
+    # Если LLM не инициализирован, используем эвристику как раньше.
+    if _text_llm is None:
+        return classify_message_heuristic(text)
+    # Системное сообщение описывает задачу классификации. Мы просим модель
+    # ответить только одним словом без точек и лишних символов. Это упрощает
+    # последующую обработку ответа.
+    system_prompt = (
+        "Ты помощник по классификации. Категоризируй пользовательский запрос "
+        "на одну из категорий: greet, list_positions, calculate, delete_position, "
+        "edit_position, finalize, help, unknown. Ответь только названием категории "
+        "без других слов.\n"
+    )
+    # Формируем список сообщений для модели: системное и пользовательское
+    from langchain_core.messages import SystemMessage, HumanMessage
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=text),
+    ]
+    try:
+        # Асинхронный вызов модели
+        response = await _text_llm.ainvoke(messages)
+        content = (response.content or "").strip().lower()
+        # Иногда модель может вернуть текст вроде "гreet" или со знаками
+        # пунктуации. Приведём к стандартному виду и проверим, входит ли
+        # результат в допустимый набор. Если нет — помечаем как unknown.
+        valid = {
+            "greet",
+            "list_positions",
+            "calculate",
+            "delete_position",
+            "edit_position",
+            "finalize",
+            "help",
+            "unknown",
+        }
+        # Удаляем все символы, кроме латинских букв, цифр и подчёркивания
+        import re
+        cleaned = re.sub(r"[^a-zA-Z0-9_]+", "", content)
+        return cleaned if cleaned in valid else "unknown"
+    except Exception:
+        # В случае любой ошибки (тайм‑аут, отсутствие API‑ключа и т.п.)
+        # используем эвристическую классификацию
+        return classify_message_heuristic(text)
+
+
+def classify_message_heuristic(text: str) -> str:
+    """
+    Очень простая эвристическая классификация сообщений. Используется как
+    запасной вариант, когда LLM недоступен. Возвращаемая метка совпадает
+    с той, что ожидает handle_nlu_message.
     """
     lowered = text.lower()
-    # greetings
+    # приветствие
     if any(word in lowered for word in ["привет", "здравств", "ку", "hello", "hi"]):
         return "greet"
-    # list of positions
-    if any(word in lowered for word in ["список", "позиции", "товары", "что", "добавлено"]):
+    # запрос списка позиций
+    if any(word in lowered for word in ["список", "позиции", "товары", "что", "добавлено", "покажи"]):
         return "list_positions"
-    # calculate final
+    # запрос на расчёт
     if any(word in lowered for word in ["расчет", "расчёт", "кто", "сколько", "должен", "рассчитать", "поделить"]):
         return "calculate"
-    # help
+    # запрос удаления позиции
+    if any(word in lowered for word in ["удали", "удалить", "сотри", "remove", "delete"]):
+        return "delete_position"
+    # запрос редактирования позиции
+    if any(word in lowered for word in ["измени", "изменить", "edit", "редакт"]):
+        return "edit_position"
+    # запрос завершения расчёта
+    if any(word in lowered for word in ["финал", "заверш", "законч", "подтверж", "итог"]):
+        return "finalize"
+    # помощь
     if "помощ" in lowered or "help" in lowered or "умеешь" in lowered:
         return "help"
     return "unknown"
+
+
+def classify_message(text: str) -> str:
+    """
+    Сохранили старую подпись функции для обратной совместимости. Она
+    вызывает эвристическую классификацию. Для использования LLM нужно
+    вызывать classify_intent_llm из асинхронного контекста. Если в
+    каких‑то местах код ещё обращается к classify_message, он будет
+    работать по старому механизму.
+    """
+    return classify_message_heuristic(text)

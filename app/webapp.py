@@ -23,19 +23,32 @@ import uvicorn
 app = FastAPI()
 
 def render_receipt_page(positions: list[dict]) -> str:
-    """Render the receipt selection page with embedded positions."""
-    # We embed the positions as a JSON array into the page using a
-    # <script> tag. This avoids the need for a full templating engine.
+    """
+    Формирует HTML‑страницу для мини‑приложения и внедряет список позиций.
+
+    Функция умеет работать как с обычными словарями, так и с моделями
+    Pydantic (Item). Для объектов Pydantic используется доступ через
+    атрибуты .name, .quantity и .price. Если эти атрибуты отсутствуют,
+    вставляется None.
+    """
     import json
-    positions_json = json.dumps([
-        {"name": p.get("name"), "quantity": p.get("quantity"), "price": p.get("price")}
-        for p in positions
-    ])
-    with open(
-        __file__.replace("webapp.py", "templates/receipt.html"), "r", encoding="utf-8"
-    ) as f:
+    normalized = []
+    for p in positions:
+        # Если позиция — словарь, используем ключи
+        if isinstance(p, dict):
+            name = p.get("name")
+            quantity = p.get("quantity")
+            price = p.get("price")
+        else:
+            # Попытка получить атрибуты у объекта
+            name = getattr(p, "name", None)
+            quantity = getattr(p, "quantity", None)
+            price = getattr(p, "price", None)
+        normalized.append({"name": name, "quantity": quantity, "price": price})
+    positions_json = json.dumps(normalized, ensure_ascii=False)
+    template_path = __file__.replace("webapp.py", "templates/receipt.html")
+    with open(template_path, "r", encoding="utf-8") as f:
         html = f.read()
-    # Inject the positions into a global JavaScript variable
     injection = f"<script>window.POSITIONS = {positions_json};</script>"
     return html.replace("</head>", f"{injection}\n</head>")
 
@@ -48,11 +61,17 @@ async def get_receipt_page(request: Request):
 
 
 if __name__ == "__main__":
+    # На Linux пути с обратным слешем интерпретируются как имя файла, а
+    # сертификаты лежат в директории cert. Используем os.path.join для
+    # корректного построения пути на разных платформах.
+    import os
+    cert_path = os.path.join("cert", "localhost+2.pem")
+    key_path = os.path.join("cert", "localhost+2-key.pem")
     uvicorn.run(
         "app.webapp:app",
         host="127.0.0.1",
         port=8432,
         reload=True,
-        ssl_certfile=r"cert\localhost+2.pem",
-        ssl_keyfile=r"cert\localhost+2-key.pem"
+        ssl_certfile=cert_path,
+        ssl_keyfile=key_path,
     )

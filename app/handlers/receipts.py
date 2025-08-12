@@ -85,18 +85,24 @@ async def handle_photo(msg: Message):
         print(f"LLM returned non-list response: {text}")
         await msg.answer(text)
         return
-
+    print("Items extracted from image:", items)
     # Добавляем полученные позиции в временное хранилище
+    items = [
+        {"name": item.name, "quantity": item.quantity, "price": item.price}
+        for item in items
+    ]
+
     add_positions(items)
 
     # Инициализируем назначение позиций для данного чата
     chat_receipt_id = str(msg.chat.id)
     init_assignments(chat_receipt_id)
 
+   
     # Формируем текст с перечислением позиций и их стоимостью
     positions_text = "\n".join(
-        #f"{item['name']} — {item['quantity']} x {item['price']}₽" for item in items
-        f"{item.name} — {item.quantity} x {item.price}₽" for item in items
+        f"{item['name']} — {item['quantity']} x {item['price']}₽" for item in items
+        #f"{item.name} — {item.quantity} x {item.price}₽" for item in items
     )
     await msg.answer(
         "✅ Позиции добавлены:\n" + positions_text
@@ -176,7 +182,8 @@ async def delete_position(call: CallbackQuery):
     await call.answer("Позиция удалена")
     # Обновить сообщение:
     text = "\n".join([
-        f"{ix+1}. {i['name']} — {i['quantity']} x {i['price']}₽"
+        #f"{ix+1}. {i['name']} — {i['quantity']} x {i['price']}₽"
+        f"{idx+1}. {i.name} — {i.quantity} x {i.price}₽"
         for ix, i in enumerate(positions)
     ])
     kb = positions_keyboard(positions)
