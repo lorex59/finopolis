@@ -124,3 +124,37 @@ async def calculate_debts_from_messages(items: dict[str, float], messages: list[
             result = await resp.json()
             # здесь предполагаем что в ответе content — JSON строка
             return eval(result["choices"][0]["message"]["content"])  # замените eval на safe parser
+
+
+# --- NLU functions ---
+def classify_message(text: str) -> str:
+    """
+    Very simple classifier of user messages into high‑level intents.
+
+    This function does not call any external LLM; instead it uses
+    heuristics based on keywords. In a real implementation you might
+    connect to an LLM (e.g. qwen via OpenRouter) and ask it to
+    categorize the incoming message. Keep this logic in one place so
+    that switching to a model later is straightforward.
+
+    Returns one of the following labels:
+      - greet: приветствие
+      - list_positions: запрос списка позиций
+      - calculate: запрос на расчёт долга
+      - help: запрос на помощь
+      - unknown: нераспознанная команда
+    """
+    lowered = text.lower()
+    # greetings
+    if any(word in lowered for word in ["привет", "здравств", "ку", "hello", "hi"]):
+        return "greet"
+    # list of positions
+    if any(word in lowered for word in ["список", "позиции", "товары", "что", "добавлено"]):
+        return "list_positions"
+    # calculate final
+    if any(word in lowered for word in ["расчет", "расчёт", "кто", "сколько", "должен", "рассчитать", "поделить"]):
+        return "calculate"
+    # help
+    if "помощ" in lowered or "help" in lowered or "умеешь" in lowered:
+        return "help"
+    return "unknown"

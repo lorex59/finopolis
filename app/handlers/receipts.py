@@ -4,7 +4,19 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 
 from services.llm_api import extract_items_from_image
-from database import add_positions, get_positions, set_positions
+from database import (
+    add_positions,
+    get_positions,
+    set_positions,
+    init_assignments,
+    set_assignment,
+    get_assignments,
+    start_text_session,
+    append_text_message,
+    end_text_session,
+    get_all_users,
+    save_debts,
+)
 from keyboards import positions_keyboard
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -16,6 +28,7 @@ from utils import parse_position
 from database import get_user
 from database import get_all_users, save_debts
 from services.payments import mass_pay
+from services.llm_api import calculate_debts_from_messages
 
 router = Router(name="receipts")
 
@@ -76,6 +89,10 @@ async def handle_photo(msg: Message):
     # Добавляем полученные позиции в временное хранилище
     add_positions(items)
 
+    # Инициализируем назначение позиций для данного чата
+    chat_receipt_id = str(msg.chat.id)
+    init_assignments(chat_receipt_id)
+
     # Формируем текст с перечислением позиций и их стоимостью
     positions_text = "\n".join(
         #f"{item['name']} — {item['quantity']} x {item['price']}₽" for item in items
@@ -109,6 +126,28 @@ async def handle_photo(msg: Message):
     except Exception as e:
         # Если не удалось сформировать кнопку, ничего страшного
         print(f"Ошибка при отправке кнопки WebApp: {e}")
+
+
+@router.message(F.web_app_data)
+async def handle_web_app_data(msg: Message):
+    """
+    Обработчик данных, присылаемых из WebApp. telegram.web_app_data.data содержит строку JSON,
+    которую нужно распарсить. Предполагаем, что она имеет структуру
+    {"selected": [0, 3, 5]} — индексы позиций, которые выбрал пользователь.
+    Храним выбор в БД через set_assignment().
+    """
+    try:
+        import json
+        data = json.loads(msg.web_app_data.data)
+        selected_indices = data.get("selected", [])
+        # Приводим индексы к целым числам
+        indices = [int(i) for i in selected_indices]
+    except Exception as e:
+        await msg.answer(f"Ошибка обработки данных из мини‑приложения: {e}")
+        return
+    receipt_id = str(msg.chat.id)
+    set_assignment(receipt_id, msg.from_user.id, indices)
+    await msg.answer("✅ Ваш выбор сохранён! Когда все участники отметят свои позиции, используйте /finalize для расчёта.")
 
 
 
@@ -218,6 +257,17 @@ async def save_new_position(msg: Message, state: FSMContext):
 # однако для примера реализовано равное распределение.
 @router.message(Command("finalize"))
 async def finalize_receipt(msg: Message):
+    """
+    Финальный расчёт для текущего чека.
+
+    Есть два режима:
+      - Если участники распределили позиции через мини‑приложение, то расходы
+        рассчитываются на основе выбранных позиций (ASSIGNMENTS).
+      - Если был активирован текстовый сценарий, то используются
+        накопленные сообщения и LLM для распределения.
+      - Если ни одно из условий не выполнено, делим сумму поровну как раньше.
+    """
+    receipt_id = str(msg.chat.id)
     positions = get_positions()
     if not positions:
         await msg.answer("Нет позиций для расчёта. Сначала отправьте чек.")
@@ -227,27 +277,114 @@ async def finalize_receipt(msg: Message):
         await msg.answer("Нет зарегистрированных пользователей для расчёта.")
         return
 
-    # Подсчитаем общую стоимость чека
+    # 1. Попробуем использовать текстовый сценарий, если он завершён
+    from database import TEXT_SESSIONS
+    session = TEXT_SESSIONS.get(receipt_id)
+    if session and not session.get("collecting") and session.get("messages"):
+        # items for LLM: convert positions to dict{name: price}
+        items_for_llm: dict[str, float] = {}
+        for item in positions:
+            try:
+                total_price = float(item.get("price", 0)) * float(item.get("quantity", 1))
+                items_for_llm[item.get("name")] = total_price
+            except Exception:
+                pass
+        messages = session["messages"]
+        try:
+            debt_mapping = await calculate_debts_from_messages(items_for_llm, messages)
+        except Exception as e:
+            await msg.answer(f"Ошибка при расчёте через LLM: {e}\nПробуем поровну разделить.")
+            debt_mapping = None
+        if isinstance(debt_mapping, dict):
+            # Округлить и привести ключи к int
+            mapping: dict[int, float] = {}
+            for k, v in debt_mapping.items():
+                try:
+                    mapping[int(k)] = round(float(v), 2)
+                except Exception:
+                    pass
+            if mapping:
+                tx_id = await mass_pay(mapping)
+                save_debts(receipt_id, mapping)
+                set_positions([])
+                # Очистим текстовую сессию
+                session["messages"] = []
+                # Отправляем каждому пользователю личное уведомление
+                for user_id, amount in mapping.items():
+                    try:
+                        await msg.bot.send_message(user_id, f"Вы должны {amount}₽. Спасибо за участие!")
+                    except Exception:
+                        pass
+                text_lines = ["💰 Расчёт завершён!", f"ID транзакции: {tx_id}"]
+                text_lines.append("\nСуммы к оплате:")
+                for user_id, amount in mapping.items():
+                    text_lines.append(f"<code>{user_id}</code> → {amount}₽")
+                await msg.answer("\n".join(text_lines), parse_mode="HTML")
+                return
+
+    # 2. Если у нас есть назначения из WebApp
+    assignments = get_assignments(receipt_id)
+    if assignments:
+        # Рассчитаем стоимость каждой позиции
+        cost_per_position = []
+        for item in positions:
+            try:
+                cost_per_position.append(float(item.get("price", 0)) * float(item.get("quantity", 1)))
+            except Exception:
+                cost_per_position.append(0.0)
+        # Считаем сумму для каждого пользователя
+        mapping: dict[int, float] = {user_id: 0.0 for user_id, _ in users}
+        for user_id, indices in assignments.items():
+            total = 0.0
+            for idx in indices:
+                if 0 <= idx < len(cost_per_position):
+                    total += cost_per_position[idx]
+            mapping[user_id] = round(total, 2)
+        # Определим плательщика (первый отправивший фото)
+        payer_id = msg.from_user.id
+        # Преобразуем mapping в формат "кто сколько кому должен":
+        # все кроме payer должны payer
+        debt_mapping: dict[int, float] = {}
+        for uid, amount in mapping.items():
+            if uid == payer_id:
+                continue
+            debt_mapping[uid] = amount
+        # Выполняем перевод (заглушка)
+        tx_id = await mass_pay(debt_mapping)
+        save_debts(receipt_id, debt_mapping)
+        set_positions([])
+        # Уведомляем каждого должника
+        for uid, amount in debt_mapping.items():
+            try:
+                await msg.bot.send_message(uid, f"Вы должны {amount}₽ пользователю {payer_id}.")
+            except Exception:
+                pass
+        text_lines = ["💰 Расчёт завершён!", f"ID транзакции: {tx_id}"]
+        text_lines.append("\nСуммы к оплате:")
+        for uid, amount in debt_mapping.items():
+            text_lines.append(f"<code>{uid}</code> → {amount}₽")
+        await msg.answer("\n".join(text_lines), parse_mode="HTML")
+        return
+
+    # 3. По умолчанию делим сумму поровну между всеми участниками
     total_cost = 0.0
     for item in positions:
         try:
             total_cost += float(item.get("price", 0)) * float(item.get("quantity", 1))
         except Exception:
             pass
-    # Делим стоимость поровну между всеми пользователями
     count = len(users)
     share = total_cost / count if count else 0.0
-    # Округляем до двух знаков после запятой
     mapping = {user_id: round(share, 2) for user_id, _ in users}
-
-    # Вызываем платёжный сервис (заглушка)
     tx_id = await mass_pay(mapping)
-    # Сохраняем информацию о долгах (receipt_id можно заменить на UUID или id чата)
-    receipt_id = str(msg.chat.id)
     save_debts(receipt_id, mapping)
-    # Очищаем текущие позиции
     set_positions([])
-    # Уведомляем участников
+    # Уведомления в личку: все долги отправляются самому себе (поровну)
+    for uid, amount in mapping.items():
+        try:
+            await msg.bot.send_message(uid, f"Вы должны {amount}₽ (поровну разделено).")
+        except Exception:
+            pass
     text_lines = ["💰 Расчёт завершён!", f"ID транзакции: {tx_id}"]
     text_lines.append("\nСуммы к оплате:")
     for user_id, amount in mapping.items():

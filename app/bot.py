@@ -25,6 +25,12 @@ async def main() -> None:
     dp.include_router(auth_handlers.router)
     dp.include_router(receipt_handlers.router)
 
+    # Подключаем обработчик естественного языка. Он должен идти последним,
+    # чтобы перехватывать только те сообщения, которые не были обработаны
+    # предыдущими роутерами (командами и коллбэками).
+    from handlers.nlu import nlu_router
+    dp.include_router(nlu_router)
+
     # Подмешиваем middleware только к группам, где id < 0
     dp.message.middleware(AuthRequiredMiddleware())
     print("Bot started.")
