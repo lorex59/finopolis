@@ -6,35 +6,59 @@
     <title>Разделение чека</title>
     <style>
       body {
-        font-family: sans-serif;
-        padding: 16px;
-        background-color: #f5f5f5;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+        padding: 20px;
+        margin: 0;
+        background-color: #f9f9fb;
+        color: #202020;
       }
       h1 {
-        font-size: 20px;
-        margin-bottom: 12px;
+        font-size: 22px;
+        margin-bottom: 16px;
+        text-align: center;
+        font-weight: 600;
+      }
+      /* Контейнер для списка позиций */
+      #list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
       }
       .item {
         display: flex;
+        align-items: center;
         justify-content: space-between;
-        padding: 8px;
-        margin-bottom: 4px;
-        background-color: #fff;
-        border-radius: 4px;
+        padding: 12px 14px;
+        background-color: #ffffff;
+        border-radius: 8px;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+        transition: background-color 0.2s ease, box-shadow 0.2s ease;
+        cursor: pointer;
+      }
+      .item:hover {
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
       }
       .item.selected {
-        background-color: #cde8ff;
+        background-color: #e6f4ff;
+      }
+      .item span {
+        font-size: 16px;
       }
       button {
-        margin-top: 16px;
+        margin-top: 20px;
         width: 100%;
-        padding: 10px;
+        padding: 12px 0;
         font-size: 16px;
+        font-weight: 500;
         background-color: #2ea44f;
         color: #fff;
         border: none;
-        border-radius: 4px;
+        border-radius: 8px;
         cursor: pointer;
+        transition: background-color 0.2s ease;
+      }
+      button:hover {
+        background-color: #24963f;
       }
     </style>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
@@ -42,18 +66,55 @@
   <body>
     <h1>Выберите позиции, которые вы покупали</h1>
     <div id="list"></div>
+    <!-- Блок с итоговой информацией о выборе -->
+    <div id="summary" style="margin-top: 12px; font-weight: bold; text-align: center;"></div>
     <button id="submit">Отправить</button>
     <script>
-      // В реальном приложении список позиций должен передаваться с сервера
-      // посредством шаблонизатора или API. Для примера берём его из
-      // глобальной переменной window.POSITIONS, которую сервер подставит.
+      /*
+       * Мини‑приложение для выбора позиций
+       *
+       * Список позиций передаётся сервером через глобальную переменную window.POSITIONS.
+       * Пользователь может выбрать несколько элементов, по каждому из которых
+       * автоматически подсчитывается стоимость (количество × цена). Внизу
+       * отображается суммарная стоимость выбранных позиций и их количество.
+       */
       const positions = window.POSITIONS || [];
       const listEl = document.getElementById('list');
+      const summaryEl = document.getElementById('summary');
+      // Будем хранить выбранные индексы и их стоимость
       const selected = new Set();
+      /**
+       * Пересчитывает количество и сумму выбранных позиций.
+       */
+      function updateSummary() {
+        let total = 0;
+        selected.forEach((idx) => {
+          const p = positions[idx];
+          // Количество и цена могут быть строками — преобразуем к числу
+          const qty = parseFloat(p.quantity) || 0;
+          const price = parseFloat(p.price) || 0;
+          total += qty * price;
+        });
+        const count = selected.size;
+        // Формируем красивую строку с количеством и суммой
+        summaryEl.textContent = count === 0
+          ? 'Ничего не выбрано'
+          : `Выбрано ${count} ${count === 1 ? 'позиция' : (count < 5 ? 'позиции' : 'позиций')} на сумму ${total.toFixed(2)}₽`;
+      }
+      // Создаём элементы списка
       positions.forEach((item, idx) => {
         const el = document.createElement('div');
         el.className = 'item';
-        el.textContent = `${item.name} — ${item.quantity} x ${item.price}₽`;
+        // Показываем название, количество и цену аккуратно
+        const nameSpan = document.createElement('span');
+        nameSpan.style.flex = '1';
+        nameSpan.textContent = item.name;
+        const qtyPriceSpan = document.createElement('span');
+        qtyPriceSpan.style.marginLeft = '8px';
+        qtyPriceSpan.textContent = `${item.quantity} x ${item.price}₽`;
+        el.appendChild(nameSpan);
+        el.appendChild(qtyPriceSpan);
+        // Обработчик клика по элементу
         el.addEventListener('click', () => {
           if (selected.has(idx)) {
             selected.delete(idx);
@@ -62,12 +123,15 @@
             selected.add(idx);
             el.classList.add('selected');
           }
+          updateSummary();
         });
         listEl.appendChild(el);
       });
+      // Инициализируем отображение
+      updateSummary();
+      // При отправке передаём выбранные индексы в бота
       document.getElementById('submit').addEventListener('click', () => {
         const data = { selected: Array.from(selected) };
-        // Отправляем данные обратно в бота
         Telegram.WebApp.sendData(JSON.stringify(data));
         Telegram.WebApp.close();
       });

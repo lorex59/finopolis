@@ -26,7 +26,7 @@ from config import settings
 from utils import parse_position
 
 from database import get_user
-from database import get_all_users, save_debts
+from database import get_all_users, save_debts, log_payment
 from services.payments import mass_pay
 from services.llm_api import calculate_debts_from_messages
 
@@ -311,21 +311,29 @@ async def finalize_receipt(msg: Message):
                 except Exception:
                     pass
             if mapping:
+                # Выполняем платёж и логируем его
                 tx_id = await mass_pay(mapping)
                 save_debts(receipt_id, mapping)
+                log_payment(receipt_id, tx_id, mapping)
                 set_positions([])
                 # Очистим текстовую сессию
                 session["messages"] = []
-                # Отправляем каждому пользователю личное уведомление
+                # Отправляем каждому пользователю личное уведомление с их суммой
                 for user_id, amount in mapping.items():
                     try:
-                        await msg.bot.send_message(user_id, f"Вы должны {amount}₽. Спасибо за участие!")
+                        # Покажем имя, если доступно
+                        user_info = get_user(user_id) or {}
+                        name = user_info.get('full_name') or user_info.get('phone') or str(user_id)
+                        await msg.bot.send_message(user_id, f"{name}, вы должны {amount}₽. Спасибо за участие!")
                     except Exception:
                         pass
+                # Формируем текст для группового чата
                 text_lines = ["💰 Расчёт завершён!", f"ID транзакции: {tx_id}"]
                 text_lines.append("\nСуммы к оплате:")
                 for user_id, amount in mapping.items():
-                    text_lines.append(f"<code>{user_id}</code> → {amount}₽")
+                    user_info = get_user(user_id) or {}
+                    name = user_info.get('full_name') or user_info.get('phone') or str(user_id)
+                    text_lines.append(f"{name} ({user_id}) → {amount}₽")
                 await msg.answer("\n".join(text_lines), parse_mode="HTML")
                 return
 
@@ -357,19 +365,28 @@ async def finalize_receipt(msg: Message):
                 continue
             debt_mapping[uid] = amount
         # Выполняем перевод (заглушка)
+        # Выполняем платёж и логируем его
         tx_id = await mass_pay(debt_mapping)
         save_debts(receipt_id, debt_mapping)
+        log_payment(receipt_id, tx_id, debt_mapping)
         set_positions([])
-        # Уведомляем каждого должника
+        # Уведомляем каждого должника персонально
         for uid, amount in debt_mapping.items():
             try:
-                await msg.bot.send_message(uid, f"Вы должны {amount}₽ пользователю {payer_id}.")
+                user_info = get_user(uid) or {}
+                name = user_info.get('full_name') or user_info.get('phone') or str(uid)
+                payer_info = get_user(payer_id) or {}
+                payer_name = payer_info.get('full_name') or payer_info.get('phone') or str(payer_id)
+                await msg.bot.send_message(uid, f"{name}, вы должны {amount}₽ пользователю {payer_name}.")
             except Exception:
                 pass
+        # Подготовим текст для группового чата с именами
         text_lines = ["💰 Расчёт завершён!", f"ID транзакции: {tx_id}"]
         text_lines.append("\nСуммы к оплате:")
         for uid, amount in debt_mapping.items():
-            text_lines.append(f"<code>{uid}</code> → {amount}₽")
+            user_info = get_user(uid) or {}
+            name = user_info.get('full_name') or user_info.get('phone') or str(uid)
+            text_lines.append(f"{name} ({uid}) → {amount}₽")
         await msg.answer("\n".join(text_lines), parse_mode="HTML")
         return
 
@@ -383,17 +400,24 @@ async def finalize_receipt(msg: Message):
     count = len(users)
     share = total_cost / count if count else 0.0
     mapping = {user_id: round(share, 2) for user_id, _ in users}
+    # Выполняем платёж и логируем его
     tx_id = await mass_pay(mapping)
     save_debts(receipt_id, mapping)
+    log_payment(receipt_id, tx_id, mapping)
     set_positions([])
-    # Уведомления в личку: все долги отправляются самому себе (поровну)
+    # Уведомления в личку: каждый получает уведомление о сумме, которую должен
     for uid, amount in mapping.items():
         try:
-            await msg.bot.send_message(uid, f"Вы должны {amount}₽ (поровну разделено).")
+            user_info = get_user(uid) or {}
+            name = user_info.get('full_name') or user_info.get('phone') or str(uid)
+            await msg.bot.send_message(uid, f"{name}, вы должны {amount}₽ (поровну разделено).")
         except Exception:
             pass
+    # Групповое сообщение с именами
     text_lines = ["💰 Расчёт завершён!", f"ID транзакции: {tx_id}"]
     text_lines.append("\nСуммы к оплате:")
     for user_id, amount in mapping.items():
-        text_lines.append(f"<code>{user_id}</code> → {amount}₽")
+        user_info = get_user(user_id) or {}
+        name = user_info.get('full_name') or user_info.get('phone') or str(user_id)
+        text_lines.append(f"{name} ({user_id}) → {amount}₽")
     await msg.answer("\n".join(text_lines), parse_mode="HTML")

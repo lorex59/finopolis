@@ -4,10 +4,66 @@
 """
 from collections import defaultdict
 from typing import Any
+import os
+import json
 
 USERS: dict[int, dict[str, Any]] = {688410426: {'full_name': 'danil', 'phone': '+79644324111', 'bank': 'Tinkoff'}}                 # user_id → профиль
 RECEIPTS: dict[str, dict[str, Any]] = defaultdict(dict)  # receipt_id → данные чека
 DEBTS: dict[str, dict[int, float]] = defaultdict(dict)    # receipt_id → user_id → сумма
+
+# Журнал выполненных платежей.
+# Каждый элемент содержит идентификатор чека, идентификатор транзакции
+# и отображение user_id → сумма, которое было отправлено в платёжную систему.
+PAYMENT_LOG: list[dict[str, object]] = []
+
+def log_payment(receipt_id: str, transaction_id: str, debt_mapping: dict[int, float]) -> None:
+    """
+    Сохраняет информацию о выполненном переводе в журнал.
+
+    Аргументы:
+        receipt_id: идентификатор чата/чека
+        transaction_id: уникальный идентификатор транзакции, возвращаемый платёжным шлюзом
+        debt_mapping: словарь user_id → сумма, которую пользователь должен
+    """
+    PAYMENT_LOG.append({
+        "receipt_id": receipt_id,
+        "transaction_id": transaction_id,
+        "debt_mapping": debt_mapping.copy(),
+    })
+
+def get_payment_log() -> list[dict[str, object]]:
+    """Возвращает копию журнала платежей."""
+    return list(PAYMENT_LOG)
+
+# Путь к файлу, в котором будем хранить список позиций. Это нужно для обмена
+# данными между ботом и мини‑приложением, которые могут работать в разных
+# процессах и не имеют общей памяти.
+POSITIONS_FILE: str = os.path.join(os.path.dirname(__file__), 'positions.json')
+
+def persist_positions(positions: list) -> None:
+    """
+    Сохраняет переданный список позиций в JSON‑файл. Мини‑приложение
+    WebApp сможет затем загрузить этот файл и получить актуальный список.
+    """
+    try:
+        with open(POSITIONS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(positions, f, ensure_ascii=False)
+    except Exception as e:
+        # выводим сообщение об ошибке, но не прерываем выполнение бота
+        print(f"Ошибка при сохранении позиций: {e}")
+
+def load_positions() -> list:
+    """
+    Загружает список позиций из JSON‑файла. Если файл отсутствует или не
+    получается его прочитать, возвращает пустой список.
+    """
+    try:
+        if os.path.exists(POSITIONS_FILE):
+            with open(POSITIONS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"Ошибка при загрузке позиций: {e}")
+    return []
 
 def save_user(user_id: int, data: dict[str, Any]) -> None:
     print(f"SAVE_USER called for {user_id} with {data}")
@@ -64,6 +120,8 @@ def add_positions(new_positions: list) -> None:
     """Append new positions to the global list."""
     global POSITIONS
     POSITIONS.extend(new_positions)
+    # также сохраняем новый список позиций в файл, чтобы его мог прочитать WebApp
+    persist_positions(POSITIONS)
 
 def get_positions() -> list:
     """Return a copy of the current positions list."""
@@ -73,6 +131,8 @@ def set_positions(positions: list) -> None:
     """Replace the current positions list entirely."""
     global POSITIONS
     POSITIONS = positions
+    # при замене списка позиций обновляем файл с позициями
+    persist_positions(POSITIONS)
 
 def init_assignments(receipt_id: str) -> None:
     """Initialise (or reset) the assignments mapping for a given receipt."""

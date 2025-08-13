@@ -17,7 +17,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from jinja2 import Template
 
-from app.database import get_positions
+from app.database import load_positions
 import uvicorn
 
 app = FastAPI()
@@ -49,13 +49,25 @@ def render_receipt_page(positions: list[dict]) -> str:
     template_path = __file__.replace("webapp.py", "templates/receipt.html")
     with open(template_path, "r", encoding="utf-8") as f:
         html = f.read()
-    injection = f"<script>window.POSITIONS = {positions_json};</script>"
-    return html.replace("</head>", f"{injection}\n</head>")
+    # Встраиваем список позиций непосредственно в клиентский скрипт. Это надёжнее,
+    # чем полагаться на глобальные переменные (которые могут быть запрещены в WebApp).
+    # Шаблон содержит строку "const positions = window.POSITIONS || [];", которую мы заменим
+    # на реальный массив. Если строка не найдена, оставим исходный html.
+    replacement = f"const positions = {positions_json};"
+    if "const positions =" in html:
+        html = html.replace("const positions = window.POSITIONS || [];", replacement)
+    else:
+        # В качестве резервного варианта добавим инъекцию в head
+        injection = f"<script>window.POSITIONS = {positions_json};</script>"
+        html = html.replace("</head>", f"{injection}\n</head>")
+    return html
 
 
 @app.get("/webapp/receipt", response_class=HTMLResponse)
 async def get_receipt_page(request: Request):
-    positions = get_positions()
+    # Загружаем позиции из файла. Это обеспечивает корректную работу, даже если бот
+    # и WebApp запущены в разных процессах.
+    positions = load_positions()
     html = render_receipt_page(positions)
     return HTMLResponse(content=html, status_code=200)
 
