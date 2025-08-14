@@ -11,6 +11,7 @@ class Settings:
     openrouter_api_key: str
     admin_id: int
     allowed_banks: tuple[str, ...]
+    bot_username: str  # имя бота (например, myawesome_bot) для формирования deep‑links
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -21,6 +22,7 @@ class Settings:
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
             admin_id=int(os.getenv("ADMIN_ID", "0")),
             allowed_banks=tuple(os.getenv("ALLOWED_BANKS", "Tinkoff,Sber,Alfa").split(",")),
+            bot_username=os.getenv("BOT_USERNAME", ""),
         )
 
 settings = Settings.from_env()

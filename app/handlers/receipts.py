@@ -57,18 +57,39 @@ async def cmd_split(msg: Message):
     try:
         # Формируем URL для мини‑приложения, добавляя идентификатор группы.
         webapp_url = f"{settings.backend_url}/webapp/receipt?group_id={msg.chat.id}"
-        kb = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="🧾 Разделить чек", web_app=WebAppInfo(url=webapp_url))]
-            ],
-            resize_keyboard=True,
-            one_time_keyboard=True,
-            input_field_placeholder="Откройте мини‑приложение"
-        )
-        await msg.answer(
-            "Нажмите кнопку ниже, чтобы открыть мини‑приложение для распределения покупок.",
-            reply_markup=kb
-        )
+        # В приватном чате можно отправлять WebApp-кнопку на обычной клавиатуре. В группах используем deep‑link.
+        if msg.chat.type == "private":
+            kb = ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="🧾 Разделить чек", web_app=WebAppInfo(url=webapp_url))]],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+                input_field_placeholder="Откройте мини‑приложение"
+            )
+            await msg.answer(
+                "Нажмите кнопку ниже, чтобы открыть мини‑приложение для распределения покупок.",
+                reply_markup=kb
+            )
+        else:
+            # Формируем deep‑link, который открывает мини‑приложение из профиля бота
+            if settings.bot_username:
+                payload = f"group_{msg.chat.id}"
+                deep_link = f"https://t.me/{settings.bot_username}?startapp={payload}"
+                kb = InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="🧾 Разделить чек", url=deep_link)]]
+                )
+                await msg.answer(
+                    "Нажмите кнопку ниже, чтобы открыть мини‑приложение для распределения покупок.",
+                    reply_markup=kb
+                )
+            else:
+                # Без имени бота отправляем прямую ссылку на страницу WebApp
+                kb = InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="🧾 Разделить чек", url=webapp_url)]]
+                )
+                await msg.answer(
+                    "Нажмите кнопку ниже, чтобы открыть мини‑приложение для распределения покупок.",
+                    reply_markup=kb
+                )
     except Exception as e:
         print(f"Ошибка при отправке кнопки WebApp: {e}")
         await msg.answer("Произошла ошибка при формировании ссылки на мини‑приложение.")
@@ -187,34 +208,43 @@ async def handle_photo(msg: Message):
     try:
         # Передаём ID группы в URL, чтобы мини‑приложение могло загрузить позиции
         webapp_url = f"{settings.backend_url}/webapp/receipt?group_id={msg.chat.id}"
-        # kb = InlineKeyboardMarkup(
-        #     inline_keyboard=[
-        #         [
-        #             InlineKeyboardButton(
-        #                 text="🧾 Разделить чек",
-        #                 web_app=WebAppInfo(url=webapp_url)
-        #             )
-        #         ]
-        #     ]
-        # )
-      
-        kb = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="🧾 Разделить чек", web_app=WebAppInfo(url=webapp_url))]
-            ],
-            resize_keyboard=True,
-            one_time_keyboard=True,   # опционально
-            input_field_placeholder="Откройте мини‑приложение"
-        )
-
-    
-        #await msg.answer("Откройте Mini App и отметьте позиции.", reply_markup=kb)
-        await msg.answer(
-            "Нажмите кнопку ниже, чтобы открыть мини‑приложение для распределения покупок.",
-            reply_markup=kb
-        )
+        # В приватных чатах Telegram позволяет использовать клавиши WebApp на reply‑клавиатуре.
+        if msg.chat.type == "private":
+            kb = ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="🧾 Разделить чек", web_app=WebAppInfo(url=webapp_url))]],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+                input_field_placeholder="Откройте мини‑приложение"
+            )
+            await msg.answer(
+                "Нажмите кнопку ниже, чтобы открыть мини‑приложение для распределения покупок.",
+                reply_markup=kb
+            )
+        else:
+            # В группах reply‑кнопки с WebApp не поддерживаются, поэтому используем deep‑link.
+            # Если задано имя бота, формируем ссылку startapp; иначе открываем страницу WebApp напрямую.
+            if settings.bot_username:
+                payload = f"group_{msg.chat.id}"
+                deep_link = f"https://t.me/{settings.bot_username}?startapp={payload}"
+                kb = InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="🧾 Разделить чек", url=deep_link)]]
+                )
+                await msg.answer(
+                    "Нажмите кнопку ниже, чтобы открыть мини‑приложение для распределения покупок.",
+                    reply_markup=kb
+                )
+            else:
+                # Если username не указан, просто отправляем ссылку на веб‑страницу
+                link = webapp_url
+                kb = InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="🧾 Разделить чек", url=link)]]
+                )
+                await msg.answer(
+                    "Нажмите кнопку ниже, чтобы открыть мини‑приложение для распределения покупок.",
+                    reply_markup=kb
+                )
     except Exception as e:
-        # Если не удалось сформировать кнопку, ничего страшного
+        # Если не удалось сформировать кнопку, просто выводим сообщение об ошибке
         print(f"Ошибка при отправке кнопки WebApp: {e}")
 
 
