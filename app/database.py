@@ -57,10 +57,13 @@ SELECTED_POSITIONS: dict[str, dict[int, list[dict]]] = defaultdict(lambda: defau
 # Совокупные выбранные позиции по группам: group_id → список всех выбранных позиций.
 GROUP_SELECTIONS: dict[str, list[dict]] = defaultdict(list)
 
-# Файл для хранения выбранных позиций. По требованию пользователя имя файла singular.
-# Данные в файле хранятся в виде словаря group_id → список позиций. Сохраняется
-# агрегированный список позиций для каждой группы (без привязки к пользователям).
+# Файл для хранения агрегированных выбранных позиций (без привязки к пользователям).
+# Формат: {"group_id": [ {name, quantity, price}, ... ], ...}
 SELECTED_POSITIONS_FILE: str = os.path.join(os.path.dirname(__file__), 'selected_position.json')
+
+# Файл для хранения детального распределения выбранных позиций по пользователям.
+# Формат: {"group_id": {"user_id": [ {name, quantity, price}, ... ], ...}, ...}
+DETAILED_SELECTED_POSITIONS_FILE: str = os.path.join(os.path.dirname(__file__), 'selected_positions.json')
 
 def _persist_selected_positions() -> None:
     """
@@ -109,6 +112,61 @@ def _load_group_selections() -> None:
     _load_selected_positions()
 
 
+# --- Детальное хранение выбранных позиций по пользователям ---
+def _persist_detailed_positions() -> None:
+    """
+    Сохраняет детальное распределение выбранных позиций в файл.
+    Формат файла: {"group_id": {"user_id": [ {name, quantity, price}, ... ], ...}, ...}.
+
+    Используется для восстановления распределений после перезапуска, в т.ч.
+    когда несколько пользователей параллельно выбирают позиции в разных группах.
+    """
+    try:
+        to_save: dict[str, dict[str, list[dict]]] = {}
+        for g, users_map in SELECTED_POSITIONS.items():
+            user_map_json: dict[str, list[dict]] = {}
+            for u_id, pos_list in users_map.items():
+                # Приводим ключ пользователя к строке для корректной сериализации
+                user_map_json[str(u_id)] = list(pos_list)
+            to_save[str(g)] = user_map_json
+        with open(DETAILED_SELECTED_POSITIONS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(to_save, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"Ошибка при сохранении детальных выбранных позиций: {e}")
+
+def _load_detailed_positions() -> None:
+    """
+    Загружает детальное распределение выбранных позиций из файла и
+    восстанавливает как SELECTED_POSITIONS, так и GROUP_SELECTIONS.
+
+    Если файл отсутствует, функция ничего не делает. В случае ошибки
+    выводится сообщение, а существующие данные не изменяются.
+    """
+    try:
+        if os.path.exists(DETAILED_SELECTED_POSITIONS_FILE):
+            with open(DETAILED_SELECTED_POSITIONS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                # Очищаем существующие структуры
+                SELECTED_POSITIONS.clear()
+                GROUP_SELECTIONS.clear()
+                for g, users_map in data.items():
+                    g_str = str(g)
+                    for u_str, pos_list in users_map.items():
+                        try:
+                            u_id = int(u_str)
+                        except Exception:
+                            # Если не удалось преобразовать к int, пропускаем
+                            continue
+                        SELECTED_POSITIONS[g_str][u_id] = list(pos_list)
+                    # Пересчитаем агрегированное представление
+                    aggregated: list[dict] = []
+                    for pos_list in SELECTED_POSITIONS[g_str].values():
+                        aggregated.extend(list(pos_list))
+                    GROUP_SELECTIONS[g_str] = aggregated
+    except Exception as e:
+        print(f"Ошибка при загрузке детальных выбранных позиций: {e}")
+
+
 def save_selected_positions(group_id: str, user_id: int, positions: list[dict]) -> None:
     """
     Сохраняет выбранные пользователем позиции для указанной группы.
@@ -138,10 +196,10 @@ def save_selected_positions(group_id: str, user_id: int, positions: list[dict]) 
     for lst in SELECTED_POSITIONS.get(group_id, {}).values():
         aggregated.extend(lst)
     GROUP_SELECTIONS[group_id] = aggregated
-    # Сохраняем агрегированное представление в файл. Детальное распределение по
-    # пользователям не сохраняется, поскольку файл хранит только список
-    # выбранных позиций для каждой группы.
+    # Сохраняем агрегированное представление в файл (без пользовательских разбиений).
     _persist_group_selections()
+    # Сохраняем детальное распределение по пользователям для восстановления при перезапуске.
+    _persist_detailed_positions()
 
 def get_selected_positions(group_id: str) -> dict[int, list[dict]]:
     """
@@ -158,9 +216,14 @@ def get_selected_positions(group_id: str) -> dict[int, list[dict]]:
         dict[int, list[dict]]: Копия распределения для указанной группы. Если группа
             отсутствует, возвращается пустой словарь.
     """
-    # Если память пуста — попытаться загрузить из файла
+    # Если память пуста — попытаться загрузить из детального файла. Если детальные
+    # распределения отсутствуют (например, старый формат), загрузим агрегированные.
     if not SELECTED_POSITIONS:
-        _load_selected_positions()
+        _load_detailed_positions()
+        # Если после загрузки детальных распределений всё ещё пусто, пробуем
+        # загрузить только агрегированные данные (старый формат).
+        if not SELECTED_POSITIONS:
+            _load_selected_positions()
     # Извлекаем копию для указанной группы
     group_map = SELECTED_POSITIONS.get(group_id, {})
     return {uid: list(pos_list) for uid, pos_list in group_map.items()}
@@ -171,7 +234,9 @@ def get_group_selected_positions(group_id: str) -> list[dict]:
     загружает данные из файла, чтобы учесть выбор, сделанный в других
     процессах.
     """
-    # Обновляем данные из файла, если таковые есть
+    # Загружаем детальные данные, чтобы синхронизировать агрегированные списки, если файл существует
+    _load_detailed_positions()
+    # Дополнительно загружаем агрегированные данные из старого файла для обратной совместимости
     _load_group_selections()
     return list(GROUP_SELECTIONS.get(group_id, []))
 
