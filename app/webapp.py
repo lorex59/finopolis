@@ -65,9 +65,19 @@ def render_receipt_page(positions: list[dict]) -> str:
 
 @app.get("/webapp/receipt", response_class=HTMLResponse)
 async def get_receipt_page(request: Request):
-    # Загружаем позиции из файла. Это обеспечивает корректную работу, даже если бот
-    # и WebApp запущены в разных процессах.
-    positions = load_positions()
+    """
+    Возвращает страницу мини‑приложения для выбора позиций. Если передан параметр
+    group_id, загружает только позиции для этой группы. В противном случае
+    возвращает пустой список позиций.
+    """
+    # Загружаем все позиции из файла (dict[group_id -> list])
+    all_positions = load_positions() or {}
+    group_id = request.query_params.get('group_id')
+    if group_id:
+        positions = all_positions.get(str(group_id), [])
+    else:
+        # Если нет group_id, не выдаём никакие позиции
+        positions = []
     html = render_receipt_page(positions)
     return HTMLResponse(content=html, status_code=200)
 

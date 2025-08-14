@@ -44,6 +44,30 @@
       .item span {
         font-size: 16px;
       }
+      .controls {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+      .controls input[type=number] {
+        width: 50px;
+        padding: 4px;
+        font-size: 14px;
+      }
+      .controls button {
+        width: 28px;
+        height: 28px;
+        font-size: 16px;
+        line-height: 1;
+        padding: 0;
+        border: 1px solid #ccc;
+        background-color: #f0f0f0;
+        cursor: pointer;
+        border-radius: 4px;
+      }
+      .controls button:hover {
+        background-color: #e0e0e0;
+      }
       button {
         margin-top: 20px;
         width: 100%;
@@ -81,58 +105,137 @@
       const positions = window.POSITIONS || [];
       const listEl = document.getElementById('list');
       const summaryEl = document.getElementById('summary');
-      // Будем хранить выбранные индексы и их стоимость
-      const selected = new Set();
+      // Храним выбранное количество по индексу позиции. По умолчанию пусто.
+      const selectedQuantities = {};
       /**
        * Пересчитывает количество и сумму выбранных позиций.
        */
       function updateSummary() {
         let total = 0;
-        selected.forEach((idx) => {
-          const p = positions[idx];
-          // Количество и цена могут быть строками — преобразуем к числу
-          const qty = parseFloat(p.quantity) || 0;
-          const price = parseFloat(p.price) || 0;
-          total += qty * price;
+        let count = 0;
+        Object.keys(selectedQuantities).forEach((idx) => {
+          const qtySelected = parseFloat(selectedQuantities[idx]) || 0;
+          if (qtySelected > 0) {
+            const p = positions[idx];
+            const price = parseFloat(p.price) || 0;
+            total += qtySelected * price;
+            count += qtySelected;
+          }
         });
-        const count = selected.size;
         // Формируем красивую строку с количеством и суммой
         summaryEl.textContent = count === 0
           ? 'Ничего не выбрано'
           : `Выбрано ${count} ${count === 1 ? 'позиция' : (count < 5 ? 'позиции' : 'позиций')} на сумму ${total.toFixed(2)}₽`;
       }
-      // Создаём элементы списка
+      // Создаём элементы списка. Для каждой позиции выводим название, исходное количество,
+      // цену и поле ввода количества, которое пользователь хочет выбрать.
       positions.forEach((item, idx) => {
         const el = document.createElement('div');
         el.className = 'item';
-        // Показываем название, количество и цену аккуратно
+        // Левая часть: название + исходное количество и цена
+        const infoContainer = document.createElement('div');
+        infoContainer.style.display = 'flex';
+        infoContainer.style.flexDirection = 'column';
+        infoContainer.style.flex = '1';
         const nameSpan = document.createElement('span');
-        nameSpan.style.flex = '1';
         nameSpan.textContent = item.name;
         const qtyPriceSpan = document.createElement('span');
-        qtyPriceSpan.style.marginLeft = '8px';
-        qtyPriceSpan.textContent = `${item.quantity} x ${item.price}₽`;
-        el.appendChild(nameSpan);
-        el.appendChild(qtyPriceSpan);
-        // Обработчик клика по элементу
-        el.addEventListener('click', () => {
-          if (selected.has(idx)) {
-            selected.delete(idx);
-            el.classList.remove('selected');
-          } else {
-            selected.add(idx);
+        qtyPriceSpan.style.fontSize = '14px';
+        qtyPriceSpan.style.color = '#666';
+        qtyPriceSpan.textContent = `${item.quantity} × ${item.price}₽`;
+        infoContainer.appendChild(nameSpan);
+        infoContainer.appendChild(qtyPriceSpan);
+        el.appendChild(infoContainer);
+        // Правая часть: число (0..item.quantity) и кнопки +/-. Также поддерживаем ввод вручную.
+        const controls = document.createElement('div');
+        controls.className = 'controls';
+        const maxQty = parseFloat(item.quantity) || 1;
+        // Кнопка минус
+        const minusBtn = document.createElement('button');
+        minusBtn.type = 'button';
+        minusBtn.textContent = '–';
+        // Поле ввода
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.min = '0';
+        input.max = String(maxQty);
+        input.step = '1';
+        input.value = '0';
+        // Кнопка плюс
+        const plusBtn = document.createElement('button');
+        plusBtn.type = 'button';
+        plusBtn.textContent = '+';
+        // Функция обновления выбранного количества и подсветки
+        function updateSelection(val) {
+          if (val > 0) {
+            selectedQuantities[idx] = val;
             el.classList.add('selected');
+          } else {
+            delete selectedQuantities[idx];
+            el.classList.remove('selected');
           }
+        }
+        // Обработчики кнопок
+        minusBtn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          let val = parseInt(input.value) || 0;
+          if (val > 0) {
+            val--;
+            input.value = String(val);
+            updateSelection(val);
+            updateSummary();
+          }
+        });
+        plusBtn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          let val = parseInt(input.value) || 0;
+          if (val < maxQty) {
+            val++;
+            input.value = String(val);
+            updateSelection(val);
+            updateSummary();
+          }
+        });
+        // Обработчик изменения вручную
+        input.addEventListener('input', () => {
+          let val = parseInt(input.value) || 0;
+          if (val < 0) val = 0;
+          if (val > maxQty) val = maxQty;
+          input.value = String(val);
+          updateSelection(val);
           updateSummary();
         });
+        // Клик по всей строке увеличивает количество на 1 (если не клик по элементам управления)
+        el.addEventListener('click', (ev) => {
+          if (ev.target === minusBtn || ev.target === plusBtn || ev.target === input) {
+            return;
+          }
+          let val = parseInt(input.value) || 0;
+          if (val < maxQty) {
+            val++;
+            input.value = String(val);
+            updateSelection(val);
+            updateSummary();
+          }
+        });
+        controls.appendChild(minusBtn);
+        controls.appendChild(input);
+        controls.appendChild(plusBtn);
+        el.appendChild(controls);
         listEl.appendChild(el);
       });
       // Инициализируем отображение
       updateSummary();
-      // При отправке передаём выбранные индексы в бота
+      // При отправке формируем объект, где key — индекс позиции, value — выбранное количество
       document.getElementById('submit').addEventListener('click', () => {
-        const data = { selected: Array.from(selected) };
-        Telegram.WebApp.sendData(JSON.stringify(data));
+        const payload = {};
+        Object.keys(selectedQuantities).forEach((idx) => {
+          const qty = parseFloat(selectedQuantities[idx]) || 0;
+          if (qty > 0) {
+            payload[idx] = qty;
+          }
+        });
+        Telegram.WebApp.sendData(JSON.stringify({ selected: payload }));
         Telegram.WebApp.close();
       });
     </script>
