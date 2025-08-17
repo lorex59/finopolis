@@ -82,18 +82,18 @@ async def get_receipt_page(request: Request):
     return HTMLResponse(content=html, status_code=200)
 
 
-if __name__ == "__main__":
-    # На Linux пути с обратным слешем интерпретируются как имя файла, а
-    # сертификаты лежат в директории cert. Используем os.path.join для
-    # корректного построения пути на разных платформах.
-    import os
-    cert_path = os.path.join("cert", "localhost+2.pem")
-    key_path = os.path.join("cert", "localhost+2-key.pem")
-    uvicorn.run(
-        "app.webapp:app",
-        host="127.0.0.1",
-        port=8432,
-        reload=True,
-        ssl_certfile=cert_path,
-        ssl_keyfile=key_path,
-    )
+# if __name__ == "__main__":
+#     # На Linux пути с обратным слешем интерпретируются как имя файла, а
+#     # сертификаты лежат в директории cert. Используем os.path.join для
+#     # корректного построения пути на разных платформах.
+#     import os
+#     cert_path = os.path.join("cert", "localhost+2.pem")
+#     key_path = os.path.join("cert", "localhost+2-key.pem")
+#     uvicorn.run(
+#         "app.webapp:app",
+#         host="127.0.0.1",
+#         port=8432,
+#         reload=True,
+#         ssl_certfile=cert_path,
+#         ssl_keyfile=key_path,
+#     )
