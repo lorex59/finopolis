@@ -14,13 +14,16 @@ injected via a simple templating mechanism here using Python string
 formatting.
 """
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from jinja2 import Template
 
 from app.database import load_positions
-import uvicorn
 
+import os, time  # ⬅ добавили
 app = FastAPI()
+
+_STARTED_AT_MONO = time.monotonic()
+
 
 def render_receipt_page(positions: list[dict]) -> str:
     """
@@ -80,6 +83,67 @@ async def get_receipt_page(request: Request):
         positions = []
     html = render_receipt_page(positions)
     return HTMLResponse(content=html, status_code=200)
+
+# --- Health helpers ----------------------------------------------------------
+def _check_positions_store() -> dict:
+    """
+    Пытается загрузить позиции и возвращает краткий статус.
+    Не делает тяжёлых операций — годится для readiness.
+    """
+    try:
+        data = load_positions() or {}
+        ok = isinstance(data, dict)
+        return {
+            "status": "ok" if ok else "error",
+            "groups": len(data) if ok else 0,
+            "type": type(data).__name__,
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def _check_template() -> dict:
+    try:
+        template_path = __file__.replace("webapp.py", "templates/receipt.html")
+        exists = os.path.isfile(template_path)
+        return {
+            "status": "ok" if exists else "missing",
+            "path": template_path,
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+
+@app.get("/health", response_class=JSONResponse)
+async def health():
+    """
+    Liveness/Readiness-проверка.
+
+    Возвращает общий статус, аптайм и детали:
+    - наличие шаблона receipt.html
+    - доступность хранилища позиций (load_positions)
+    """
+    details = {
+        "template_receipt_html": _check_template(),
+        "positions_store": _check_positions_store(),
+    }
+    # Если что-то 'error' или 'missing' — считаем degraded, но 200 оставляем,
+    # чтобы не флапать liveness без крайней необходимости.
+    overall = "ok"
+    for d in details.values():
+        if d.get("status") in {"error", "missing"}:
+            overall = "degraded"
+            break
+
+    return JSONResponse(
+        {
+            "status": overall,
+            "uptime_seconds": round(time.monotonic() - _STARTED_AT_MONO, 2),
+            "details": details,
+        },
+        status_code=200,
+    )
 
 
 # if __name__ == "__main__":
