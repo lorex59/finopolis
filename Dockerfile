@@ -21,7 +21,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Копируем весь код
 COPY . .
 
-
+# Генерируем сертификат и устанавливаем конфигурацию Nginx
+RUN mkdir -p /etc/ssl/certs /etc/ssl/private && \
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+        -keyout /etc/ssl/private/privkey.pem \
+        -out /etc/ssl/certs/fullchain.pem \
+        -subj "/CN=176-108-244-31.nip.io"
 
 COPY nginx.conf /etc/nginx/nginx.conf
 
