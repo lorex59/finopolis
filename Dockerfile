@@ -32,5 +32,6 @@ COPY nginx.conf /etc/nginx/nginx.conf
 
 EXPOSE 80 443
 ENV BACKEND_URL=https://176-108-244-31.nip.io
+ENV PYTHONPATH="/app/app"
 CMD ["bash", "-c", "python -m app.bot & python -m uvicorn app.webapp:app --host 0.0.0.0 --port 8000 & nginx -g 'daemon off;'"]
 
