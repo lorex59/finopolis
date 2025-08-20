@@ -44,5 +44,4 @@ ENV BACKEND_URL=https://176-108-244-31.nip.io
 ## работают на фоне (&), nginx остаётся в первом плане для корректного
 ## управления процессом.
 CMD ["bash", "-c", \
-     "python -m app.bot & python -m uvicorn app.webapp:app --host 0.0.0.0 --port 8000 & nginx -g 'daemon off;'"
-]
+     "python -m app.bot & python -m uvicorn app.webapp:app --host 0.0.0.0 --port 8000 & nginx -g 'daemon off;'"]
