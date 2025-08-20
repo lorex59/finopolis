@@ -1,13 +1,110 @@
 """
-Простейшая in‑memory "БД".
-В продакшене заменить на Postgres / Redis.
+Вспомогательный модуль для хранения данных.
+
+Ранее все данные хранились в Python‑структурах и JSON‑файлах.
+Теперь реализация использует SQLite для постоянства между запусками и
+одновременной работы Telegram‑бота и мини‑приложения. Тем не менее
+часть старых глобальных словарей оставлена для обратной совместимости:
+некоторые функции по‑прежнему читают из них, но при сохранении данные
+сначала записываются в базу данных, затем обновляют in‑memory
+структуры.
+
+Таблицы базы данных:
+
+* accounts: хранит профили пользователей. Поля:
+    - id             INTEGER PRIMARY KEY AUTOINCREMENT
+    - phone_number   TEXT
+    - full_name      TEXT
+    - telegram_login TEXT (используется для хранения Telegram‑идентификатора пользователя или username)
+    - bank           TEXT (дополнительный атрибут)
+    - telegram_id    TEXT UNIQUE (строковый идентификатор пользователя в Telegram)
+
+* positions: хранит позиции из чеков. Поля:
+    - id       INTEGER PRIMARY KEY AUTOINCREMENT
+    - group_id TEXT (идентификатор чата/группы)
+    - name     TEXT
+    - quantity REAL
+    - price    REAL
+
+* selected_positions: хранит выбор пользователей. Поля:
+    - id          INTEGER PRIMARY KEY AUTOINCREMENT
+    - group_id    TEXT
+    - user_tg_id  TEXT (Telegram‑идентификатор пользователя)
+    - position_id INTEGER (ссылка на positions.id, может быть NULL)
+    - quantity    REAL
+    - price       REAL
+
+По умолчанию база данных создаётся в файле `database.db` рядом с этим модулем.
+Функция init_db() вызывается при импорте, чтобы гарантировать наличие
+необходимых таблиц.
 """
+
 from collections import defaultdict
 from typing import Any
 import os
 import json
+import sqlite3
 
-USERS: dict[int, dict[str, Any]] = {688410426: {'full_name': 'danil', 'phone': '+79644324111', 'bank': 'Tinkoff'}}                 # user_id → профиль
+# ---------------------------------------------------------------------------
+# Настройка SQLite
+# ---------------------------------------------------------------------------
+# Путь к файлу базы данных. Делаем его относительным к текущей директории.
+DB_PATH: str = os.path.join(os.path.dirname(__file__), "database.db")
+
+def get_db_connection() -> sqlite3.Connection:
+    """Создаёт и возвращает новое соединение с базой данных.
+
+    Мы отключаем проверку потока (check_same_thread=False), так как
+    соединения могут использоваться в асинхронном коде, где разные
+    корутины работают в разных потоках. Каждое обращение получает
+    собственное соединение, поэтому закрывайте его после использования.
+    """
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db() -> None:
+    """Создаёт необходимые таблицы, если они не существуют."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone_number TEXT,
+            full_name TEXT,
+            telegram_login TEXT,
+            bank TEXT,
+            telegram_id TEXT UNIQUE
+        );
+        CREATE TABLE IF NOT EXISTS positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT,
+            name TEXT,
+            quantity REAL,
+            price REAL
+        );
+        CREATE TABLE IF NOT EXISTS selected_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT,
+            user_tg_id TEXT,
+            position_id INTEGER,
+            quantity REAL,
+            price REAL,
+            FOREIGN KEY (position_id) REFERENCES positions(id)
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+# Инициализируем базу данных при импорте.
+init_db()
+
+# ---------------------------------------------------------------------------
+# Старые in‑memory структуры для обратной совместимости. Они будут
+# синхронизированы с базой данных по мере необходимости.
+USERS: dict[int, dict[str, Any]] = {688410426: {'full_name': 'danil', 'phone': '+79644324111', 'bank': 'Tinkoff'}}  # user_id → профиль
 RECEIPTS: dict[str, dict[str, Any]] = defaultdict(dict)  # receipt_id → данные чека
 DEBTS: dict[str, dict[int, float]] = defaultdict(dict)    # receipt_id → user_id → сумма
 
@@ -17,8 +114,7 @@ DEBTS: dict[str, dict[int, float]] = defaultdict(dict)    # receipt_id → user_
 PAYMENT_LOG: list[dict[str, object]] = []
 
 def log_payment(receipt_id: str, transaction_id: str, debt_mapping: dict[int, float]) -> None:
-    """
-    Сохраняет информацию о выполненном переводе в журнал.
+    """Сохраняет информацию о выполненном переводе в журнал (в памяти).
 
     Аргументы:
         receipt_id: идентификатор чата/чека
@@ -181,25 +277,52 @@ def save_selected_positions(group_id: str, user_id: int, positions: list[dict]) 
         user_id: Идентификатор пользователя Telegram, сделавшего выбор.
         positions: Список позиций (словарей с ключами name, quantity, price).
     """
-    # Обновляем детальные данные о выбранных позициях
+    """Сохраняет выбранные пользователем позиции для указанной группы.
+
+    Данные записываются в таблицу `selected_positions`. Перед вставкой
+    удаляется предыдущий выбор пользователя для данной группы. После
+    обновления база данных синхронизируется с in‑memory структурами
+    SELECTED_POSITIONS и GROUP_SELECTIONS.
+    """
+    # Сохраняем в базу данных
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Удаляем прежний выбор этого пользователя в группе
+    cur.execute(
+        "DELETE FROM selected_positions WHERE group_id = ? AND user_tg_id = ?",
+        (str(group_id), str(user_id)),
+    )
     if positions:
-        SELECTED_POSITIONS[group_id][user_id] = positions
+        for pos in positions:
+            name = pos.get('name')
+            quantity = pos.get('quantity')
+            price = pos.get('price')
+            # Находим id исходной позиции, если она существует
+            cur.execute(
+                "SELECT id FROM positions WHERE group_id = ? AND name = ? AND price = ? ORDER BY id LIMIT 1",
+                (str(group_id), name, price),
+            )
+            row = cur.fetchone()
+            position_id = row['id'] if row else None
+            cur.execute(
+                "INSERT INTO selected_positions (group_id, user_tg_id, position_id, quantity, price) VALUES (?, ?, ?, ?, ?)",
+                (str(group_id), str(user_id), position_id, quantity, price),
+            )
+    conn.commit()
+    conn.close()
+    # Обновляем in‑memory SELECTED_POSITIONS
+    if positions:
+        SELECTED_POSITIONS[str(group_id)][user_id] = positions
     else:
-        # Удаляем выбор пользователя
-        if group_id in SELECTED_POSITIONS and user_id in SELECTED_POSITIONS[group_id]:
-            del SELECTED_POSITIONS[group_id][user_id]
-            # Если в группе не осталось выборов, удаляем группу
-            if not SELECTED_POSITIONS[group_id]:
-                del SELECTED_POSITIONS[group_id]
-    # Пересчитываем агрегированное представление: объединяем выборы всех пользователей
+        if str(group_id) in SELECTED_POSITIONS and user_id in SELECTED_POSITIONS[str(group_id)]:
+            del SELECTED_POSITIONS[str(group_id)][user_id]
+            if not SELECTED_POSITIONS[str(group_id)]:
+                del SELECTED_POSITIONS[str(group_id)]
+    # Пересчитываем агрегированное представление
     aggregated: list[dict] = []
-    for lst in SELECTED_POSITIONS.get(group_id, {}).values():
+    for lst in SELECTED_POSITIONS.get(str(group_id), {}).values():
         aggregated.extend(lst)
-    GROUP_SELECTIONS[group_id] = aggregated
-    # Сохраняем агрегированное представление в файл (без пользовательских разбиений).
-    _persist_group_selections()
-    # Сохраняем детальное распределение по пользователям для восстановления при перезапуске.
-    _persist_detailed_positions()
+    GROUP_SELECTIONS[str(group_id)] = aggregated
 
 def get_selected_positions(group_id: str) -> dict[int, list[dict]]:
     """
@@ -216,17 +339,47 @@ def get_selected_positions(group_id: str) -> dict[int, list[dict]]:
         dict[int, list[dict]]: Копия распределения для указанной группы. Если группа
             отсутствует, возвращается пустой словарь.
     """
-    # Если память пуста — попытаться загрузить из детального файла. Если детальные
-    # распределения отсутствуют (например, старый формат), загрузим агрегированные.
-    if not SELECTED_POSITIONS:
-        _load_detailed_positions()
-        # Если после загрузки детальных распределений всё ещё пусто, пробуем
-        # загрузить только агрегированные данные (старый формат).
-        if not SELECTED_POSITIONS:
-            _load_selected_positions()
-    # Извлекаем копию для указанной группы
-    group_map = SELECTED_POSITIONS.get(group_id, {})
-    return {uid: list(pos_list) for uid, pos_list in group_map.items()}
+    """Возвращает распределённые позиции для указанной группы.
+
+    Данные извлекаются из таблицы `selected_positions` и объединяются по
+    пользователям. Для удобства также синхронизируются in‑memory
+    SELECTED_POSITIONS и GROUP_SELECTIONS.
+
+    Args:
+        group_id: строковый идентификатор группы.
+
+    Returns:
+        dict[int, list[dict]]: отображение user_id → список выбранных позиций.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT sp.user_tg_id, sp.quantity, sp.price, p.name
+        FROM selected_positions sp
+        LEFT JOIN positions p ON sp.position_id = p.id
+        WHERE sp.group_id = ?
+        ORDER BY sp.id
+        """,
+        (str(group_id),),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    result: dict[int, list[dict]] = {}
+    for row in rows:
+        try:
+            uid = int(row['user_tg_id']) if row['user_tg_id'] is not None else None
+        except Exception:
+            uid = None
+        if uid is None:
+            continue
+        name = row['name'] if row['name'] is not None else ''
+        item = {'name': name, 'quantity': row['quantity'], 'price': row['price']}
+        result.setdefault(uid, []).append(item)
+    # Синхронизируем in‑memory
+    SELECTED_POSITIONS[str(group_id)] = {uid: list(lst) for uid, lst in result.items()}
+    GROUP_SELECTIONS[str(group_id)] = [pos for lst in result.values() for pos in lst]
+    return result
 
 def get_group_selected_positions(group_id: str) -> list[dict]:
     """
@@ -234,11 +387,40 @@ def get_group_selected_positions(group_id: str) -> list[dict]:
     загружает данные из файла, чтобы учесть выбор, сделанный в других
     процессах.
     """
-    # Загружаем детальные данные, чтобы синхронизировать агрегированные списки, если файл существует
-    _load_detailed_positions()
-    # Дополнительно загружаем агрегированные данные из старого файла для обратной совместимости
-    _load_group_selections()
-    return list(GROUP_SELECTIONS.get(group_id, []))
+    """Возвращает совокупные выбранные позиции для группы.
+
+    Данные извлекаются из таблицы `selected_positions` без учёта
+    разбивки по пользователям. Для совместимости также обновляет
+    in‑memory GROUP_SELECTIONS.
+
+    Args:
+        group_id: строковый идентификатор группы.
+
+    Returns:
+        list[dict]: список выбранных позиций (каждый элемент —
+        словарь с ключами name, quantity, price).
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT sp.quantity, sp.price, p.name
+        FROM selected_positions sp
+        LEFT JOIN positions p ON sp.position_id = p.id
+        WHERE sp.group_id = ?
+        ORDER BY sp.id
+        """,
+        (str(group_id),),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    result: list[dict] = []
+    for row in rows:
+        name = row['name'] if row['name'] is not None else ''
+        result.append({'name': name, 'quantity': row['quantity'], 'price': row['price']})
+    # Обновляем GROUP_SELECTIONS для совместимости
+    GROUP_SELECTIONS[str(group_id)] = list(result)
+    return result
 
 # Путь к файлу, в котором будем хранить список позиций. Это нужно для обмена
 # данными между ботом и мини‑приложением, которые могут работать в разных
@@ -246,46 +428,176 @@ def get_group_selected_positions(group_id: str) -> list[dict]:
 POSITIONS_FILE: str = os.path.join(os.path.dirname(__file__), 'positions.json')
 
 def persist_positions(positions: dict[str, list]) -> None:
+    """Сохраняет все позиции в базу данных.
+
+    Этот метод удаляет существующие записи из таблицы `positions` и
+    вставляет новые строки согласно переданному словарю. Также
+    синхронизирует in‑memory POSITIONS для обратной совместимости.
+
+    Args:
+        positions: словарь group_id → список позиций.
     """
-    Сохраняет переданный словарь позиций в JSON‑файл. Ключами
-    являются идентификаторы групп, значениями — списки позиций. Мини‑приложение
-    WebApp сможет затем загрузить файл и получить актуальные позиции по группе.
-    """
-    try:
-        with open(POSITIONS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(positions, f, ensure_ascii=False)
-    except Exception as e:
-        print(f"Ошибка при сохранении позиций: {e}")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Удаляем все записи
+    cur.execute("DELETE FROM positions")
+    # Вставляем новые
+    for group_id, pos_list in positions.items():
+        for pos in pos_list:
+            cur.execute(
+                "INSERT INTO positions (group_id, name, quantity, price) VALUES (?, ?, ?, ?)",
+                (str(group_id), pos.get('name'), pos.get('quantity'), pos.get('price')),
+            )
+    conn.commit()
+    conn.close()
+    # Синхронизируем in‑memory POSITIONS
+    POSITIONS.clear()
+    for g, lst in positions.items():
+        POSITIONS[str(g)] = list(lst)
 
 def load_positions() -> dict[str, list]:
+    """Загружает словарь позиций из базы данных.
+
+    Выбирает все записи из таблицы `positions`, группируя их по group_id.
+    Также синхронизирует in‑memory POSITIONS. Если записей нет,
+    возвращает пустой словарь.
+
+    Returns:
+        dict[str, list]: словарь, где ключ — group_id, значение — список позиций.
     """
-    Загружает словарь позиций из JSON‑файла. Если файл отсутствует или не
-    получается его прочитать, возвращает пустой словарь.
-    """
-    try:
-        if os.path.exists(POSITIONS_FILE):
-            with open(POSITIONS_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                # Убедимся, что это словарь. Если список, преобразуем
-                if isinstance(data, dict):
-                    return {str(k): v for k, v in data.items()}
-                # Если старая схема (список), помещаем в специальный ключ
-                if isinstance(data, list):
-                    return {"default": data}
-    except Exception as e:
-        print(f"Ошибка при загрузке позиций: {e}")
-    return {}
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT group_id, name, quantity, price FROM positions ORDER BY id")
+    rows = cur.fetchall()
+    conn.close()
+    result: dict[str, list] = {}
+    # Очищаем in‑memory POSITIONS
+    POSITIONS.clear()
+    for row in rows:
+        g_id = str(row['group_id'])
+        item = {'name': row['name'], 'quantity': row['quantity'], 'price': row['price']}
+        result.setdefault(g_id, []).append(item)
+        POSITIONS[g_id].append(item.copy())
+    return result
 
 def save_user(user_id: int, data: dict[str, Any]) -> None:
-    print(f"SAVE_USER called for {user_id} with {data}")
+    """Сохраняет данные пользователя в базу данных и обновляет in‑memory словарь.
 
-    USERS[user_id] = data
+    Аргументы:
+        user_id: Telegram‑идентификатор пользователя (целое число).
+        data: словарь со следующими ключами:
+            - full_name
+            - phone или phone_number
+            - bank (опционально)
+            - telegram_login (опционально)
+
+    В таблице accounts поле telegram_id используется для хранения строкового
+    представления user_id, поэтому для обновления записи ищем по нему.
+    Если запись существует, обновляем её; иначе вставляем новую.
+    После обновления синхронизируем глобальный словарь USERS.
+    """
+    # Извлекаем данные из словаря
+    full_name = data.get('full_name') or data.get('fio')
+    phone = data.get('phone') or data.get('phone_number')
+    bank = data.get('bank')
+    telegram_login = data.get('telegram_login')
+    telegram_id = str(user_id)
+
+    # Запись в базу данных
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Проверяем, существует ли пользователь по telegram_id
+    cur.execute("SELECT id FROM accounts WHERE telegram_id = ?", (telegram_id,))
+    row = cur.fetchone()
+    if row:
+        # Обновляем существующую запись
+        cur.execute(
+            "UPDATE accounts SET phone_number = ?, full_name = ?, telegram_login = ?, bank = ? WHERE telegram_id = ?",
+            (phone, full_name, telegram_login, bank, telegram_id),
+        )
+    else:
+        # Вставляем новую запись
+        cur.execute(
+            "INSERT INTO accounts (phone_number, full_name, telegram_login, bank, telegram_id) VALUES (?, ?, ?, ?, ?)",
+            (phone, full_name, telegram_login, bank, telegram_id),
+        )
+    conn.commit()
+    conn.close()
+
+    # Обновляем in‑memory словарь для обратной совместимости
+    USERS[user_id] = {
+        'full_name': full_name,
+        'phone': phone,
+        'bank': bank,
+        # telegram_login сохраняем, если есть
+        **({'telegram_login': telegram_login} if telegram_login else {}),
+    }
 
 
 def get_all_users():
-    return USERS.items()
+    """Возвращает список (user_id, данные) для всех пользователей.
+
+    Пользователи извлекаются из базы данных. Если in‑memory словарь USERS
+    содержит дополнительные элементы, они будут объединены с данными из базы.
+    Возвращается итератор, совместимый с предыдущей версией.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT telegram_id, phone_number, full_name, bank, telegram_login FROM accounts")
+    rows = cur.fetchall()
+    conn.close()
+    result: list[tuple[int, dict[str, Any]]] = []
+    for row in rows:
+        try:
+            uid = int(row['telegram_id']) if row['telegram_id'] is not None else None
+        except Exception:
+            uid = None
+        if uid is None:
+            continue
+        user_dict: dict[str, Any] = {
+            'full_name': row['full_name'],
+            'phone': row['phone_number'],
+            'bank': row['bank'],
+        }
+        # telegram_login необязателен
+        if row['telegram_login']:
+            user_dict['telegram_login'] = row['telegram_login']
+        result.append((uid, user_dict))
+        # синхронизируем USERS
+        USERS[uid] = user_dict
+    # Также добавляем оставшиеся записи из USERS, которых нет в базе
+    for uid, data in USERS.items():
+        if not any(uid == r[0] for r in result):
+            result.append((uid, data))
+    return result
 
 def get_user(user_id: int) -> dict[str, Any] | None:
+    """Возвращает профиль пользователя по его Telegram‑идентификатору.
+
+    Сначала пытается найти пользователя в базе данных (поле telegram_id).
+    Если не найден, возвращает данные из in‑memory словаря USERS, если они есть.
+    """
+    telegram_id = str(user_id)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT phone_number, full_name, bank, telegram_login FROM accounts WHERE telegram_id = ?",
+        (telegram_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        user_dict: dict[str, Any] = {
+            'full_name': row['full_name'],
+            'phone': row['phone_number'],
+            'bank': row['bank'],
+        }
+        if row['telegram_login']:
+            user_dict['telegram_login'] = row['telegram_login']
+        # синхронизируем USERS
+        USERS[user_id] = user_dict
+        return user_dict
+    # если нет в базе, смотрим в USERS
     return USERS.get(user_id)
 
 def save_receipt(receipt_id: str, items: dict[str, float]) -> None:
@@ -338,8 +650,19 @@ def add_positions(group_id: str, new_positions: list) -> None:
         group_id: строковый идентификатор группы (например, chat.id в строковом виде).
         new_positions: список позиций (словари с полями name, quantity, price).
     """
-    POSITIONS[group_id].extend(new_positions)
-    persist_positions(POSITIONS)
+    # Сохраняем позиции в базу данных и обновляем in‑memory словарь.
+    # Получаем соединение для выполнения транзакции.
+    conn = get_db_connection()
+    cur = conn.cursor()
+    for pos in new_positions:
+        cur.execute(
+            "INSERT INTO positions (group_id, name, quantity, price) VALUES (?, ?, ?, ?)",
+            (str(group_id), pos.get('name'), pos.get('quantity'), pos.get('price')),
+        )
+    conn.commit()
+    conn.close()
+    # Обновляем in‑memory список для группы, добавляя новые позиции.
+    POSITIONS[str(group_id)].extend(new_positions)
 
 def get_positions(group_id: str | None = None) -> list:
     """
@@ -352,13 +675,37 @@ def get_positions(group_id: str | None = None) -> list:
     Returns:
         list: копия списка позиций.
     """
+    # Подключаемся к базе данных и создаём курсор
+    conn = get_db_connection()
+    cur = conn.cursor()
     if group_id is None:
-        # объединяем все позиции
+        cur.execute("SELECT group_id, name, quantity, price FROM positions ORDER BY id")
+        rows = cur.fetchall()
+        # Закрываем соединение сразу после выборки
+        conn.close()
+        # Пересобираем in‑memory POSITIONS и формируем объединённый список
+        POSITIONS.clear()
         combined: list[dict] = []
-        for lst in POSITIONS.values():
-            combined.extend(lst)
-        return list(combined)
-    return list(POSITIONS.get(group_id, []))
+        for row in rows:
+            g_id = str(row['group_id'])
+            item = {'name': row['name'], 'quantity': row['quantity'], 'price': row['price']}
+            POSITIONS[g_id].append(item)
+            combined.append(item.copy())
+        return combined
+    else:
+        cur.execute(
+            "SELECT name, quantity, price FROM positions WHERE group_id = ? ORDER BY id",
+            (str(group_id),),
+        )
+        rows = cur.fetchall()
+        # Закрываем соединение
+        conn.close()
+        result = [
+            {'name': row['name'], 'quantity': row['quantity'], 'price': row['price']}
+            for row in rows
+        ]
+        POSITIONS[str(group_id)] = list(result)
+        return result
 
 def set_positions(group_id: str, positions: list) -> None:
     """
@@ -369,14 +716,21 @@ def set_positions(group_id: str, positions: list) -> None:
         group_id: идентификатор группы.
         positions: новый список позиций.
     """
-    POSITIONS[group_id] = positions
-    # если список пуст и группа не имеет позиций, можно удалить ключ
-    if not positions:
-        try:
-            del POSITIONS[group_id]
-        except KeyError:
-            pass
-    persist_positions(POSITIONS)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM positions WHERE group_id = ?", (str(group_id),))
+    if positions:
+        for pos in positions:
+            cur.execute(
+                "INSERT INTO positions (group_id, name, quantity, price) VALUES (?, ?, ?, ?)",
+                (str(group_id), pos.get('name'), pos.get('quantity'), pos.get('price')),
+            )
+    conn.commit()
+    conn.close()
+    if positions:
+        POSITIONS[str(group_id)] = list(positions)
+    else:
+        POSITIONS.pop(str(group_id), None)
 
 def init_assignments(receipt_id: str) -> None:
     """Initialise (or reset) the assignments mapping for a given receipt."""
