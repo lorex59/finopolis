@@ -92,7 +92,7 @@
     <div id="list"></div>
     <!-- Блок с итоговой информацией о выборе -->
     <div id="summary" style="margin-top: 12px; font-weight: bold; text-align: center;"></div>
-    <button id="submit">Отправить</button>
+      <button id="submit">Отправить</button>
     <script>
       /*
        * Мини‑приложение для выбора позиций
@@ -226,7 +226,12 @@
       });
       // Инициализируем отображение
       updateSummary();
-      // При отправке формируем объект, где key — индекс позиции, value — выбранное количество
+      // ----------------------------------------------------------------------
+      // При отправке формируем объект, где key — индекс позиции, value — выбранное количество.
+      // Дополнительно передаём идентификатор группы (group_id), чтобы бот мог
+      // сопоставить выбор пользователя с нужным чатом. В зависимости от того,
+      // как было открыто мини‑приложение, group_id можно получить либо из
+      // параметров URL (?group_id=...), либо из Telegram.WebApp.initDataUnsafe.start_param.
       document.getElementById('submit').addEventListener('click', () => {
         const payload = {};
         Object.keys(selectedQuantities).forEach((idx) => {
@@ -235,7 +240,31 @@
             payload[idx] = qty;
           }
         });
-        Telegram.WebApp.sendData(JSON.stringify({ selected: payload }));
+        // Определяем group_id. Сначала пробуем параметр group_id в URL, затем
+        // start_param, который передаётся через deep‑link (?startapp=group_<id>).
+        let groupId = null;
+        try {
+          const params = new URLSearchParams(window.location.search);
+          groupId = params.get('group_id');
+        } catch (e) {
+          groupId = null;
+        }
+        // Если groupId не найден в query, пытаемся разобрать start_param из initData.
+        try {
+          const initData = Telegram?.WebApp?.initDataUnsafe || {};
+          const startParam = initData.start_param || initData.startParam;
+          if (!groupId && typeof startParam === 'string' && startParam.startsWith('group_')) {
+            groupId = startParam.slice('group_'.length);
+          }
+        } catch (e) {
+          // ignore
+        }
+        // Формируем итоговый объект. Включаем group_id, если он найден.
+        const dataToSend = { selected: payload };
+        if (groupId) {
+          dataToSend.group_id = groupId;
+        }
+        Telegram.WebApp.sendData(JSON.stringify(dataToSend));
         Telegram.WebApp.close();
       });
     </script>

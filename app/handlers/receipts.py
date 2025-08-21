@@ -259,10 +259,13 @@ async def handle_web_app_data(msg: Message):
     try:
         import json
         print(f"Received web_app_data: {msg.web_app_data.data}")
-        data = json.loads(msg.web_app_data.data)
+        data = json.loads(msg.web_app_data.data or '{}')
+        # group_id может быть передан из мини‑приложения для группового разделения. Если его нет,
+        # используем chat.id (актуально для приватных чатов).
+        group_id = str(data.get('group_id') or msg.chat.id)
         selected_data = data.get("selected", {})
         indices: list[int] = []
-        # Если selected — словарь {index: quantity}, формируем список индексов с повторениями
+        # selected может быть словарём {index: quantity} или списком индексов.
         if isinstance(selected_data, dict):
             for idx_str, qty in selected_data.items():
                 try:
@@ -273,7 +276,6 @@ async def handle_web_app_data(msg: Message):
                 for _ in range(max(q, 0)):
                     indices.append(idx)
         elif isinstance(selected_data, list):
-            # Старый формат: просто список индексов
             for i in selected_data:
                 try:
                     indices.append(int(i))
@@ -281,14 +283,14 @@ async def handle_web_app_data(msg: Message):
                     pass
         else:
             indices = []
-        print(f"Received indices from WebApp: {indices}")
+        print(f"Received indices from WebApp: {indices}, group_id: {group_id}")
     except Exception as e:
         await msg.answer(f"Ошибка обработки данных из мини‑приложения: {e}")
         return
-    receipt_id = str(msg.chat.id)
+    # Сохраняем выбор пользователя для данного чека (group_id).
+    receipt_id = str(group_id)
     set_assignment(receipt_id, msg.from_user.id, indices)
     try:
-        group_id = str(msg.chat.id)
         all_positions = get_positions(group_id)
         selected_positions: list[dict] = []
         if isinstance(selected_data, dict):

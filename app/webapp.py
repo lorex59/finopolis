@@ -75,7 +75,15 @@ async def get_receipt_page(request: Request):
     """
     # Загружаем все позиции из файла (dict[group_id -> list])
     all_positions = load_positions() or {}
+    # Определяем идентификатор группы (чата), для которого нужно загрузить позиции.
+    # В первую очередь берём параметр group_id, переданный в URL напрямую.
     group_id = request.query_params.get('group_id')
+    if not group_id:
+        # Если group_id не указан, пробуем извлечь его из tgWebAppStartParam,
+        # который Telegram передаёт при открытии мини‑приложения через deep‑link.
+        start_param = request.query_params.get('tgWebAppStartParam')
+        if start_param and isinstance(start_param, str) and start_param.startswith('group_'):
+            group_id = start_param[len('group_'):]
     if group_id:
         positions = all_positions.get(str(group_id), [])
     else:
