@@ -285,11 +285,17 @@ async def handle_web_app_data(msg: Message):
     except Exception as e:
         await msg.answer(f"Ошибка обработки данных из мини‑приложения: {e}")
         return
-    receipt_id = str(msg.chat.id)
+    # When the mini‑app is opened via a deep‑link in a group, the message
+    # containing the selection is sent from the user's private chat. To
+    # correctly associate the selection with the original group, we look
+    # for a "group_id" field in the received data. If absent, fall back
+    # to using the current chat ID (suitable for private chat usage).
+    group_id = str(data.get("group_id") or msg.chat.id)
+    receipt_id = group_id
     set_assignment(receipt_id, msg.from_user.id, indices)
     try:
-        group_id = str(msg.chat.id)
-        all_positions = get_positions(group_id)
+        # Retrieve all positions for the identified group. Use list from storage.
+        all_positions = get_positions(str(group_id))
         selected_positions: list[dict] = []
         if isinstance(selected_data, dict):
             for idx_str, qty in selected_data.items():
@@ -306,7 +312,7 @@ async def handle_web_app_data(msg: Message):
                 if 0 <= idx < len(all_positions):
                     orig = all_positions[idx]
                     selected_positions.append({"name": orig.get("name"), "quantity": 1, "price": orig.get("price")})
-        save_selected_positions(group_id, msg.from_user.id, selected_positions)
+        save_selected_positions(str(group_id), msg.from_user.id, selected_positions)
     except Exception as e:
         print(f"Ошибка при сохранении распределённых позиций: {e}")
     await msg.answer(
