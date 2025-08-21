@@ -349,10 +349,10 @@ async def delete_position(call: CallbackQuery):
     await call.answer("Позиция удалена")
     # Обновить сообщение:
     text = "\n".join([
-        #f"{ix+1}. {i['name']} — {i['quantity']} x {i['price']}₽"
-        f"{idx+1}. {i.name} — {i.quantity} x {i.price}₽"
-        for ix, i in enumerate(positions)
+        f"{ix+1}. {item.get('name')} — {item.get('quantity')} x {item.get('price')}₽"
+        for ix, item in enumerate(positions)
     ])
+
     kb = positions_keyboard(positions)
     await call.message.edit_text(f"<b>Все позиции:</b>\n{text}", parse_mode="HTML", reply_markup=kb)
 

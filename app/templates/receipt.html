@@ -112,20 +112,23 @@
        * Возвращает строку groupId или null, если параметр отсутствует.
        */
       function extractGroupId() {
-        try {
-          const initData = tg.initDataUnsafe || {};
-          let p = initData.start_param;
-          if (!p) return null;
-          // Сравниваем префикс group_
-          if (typeof p === 'string' && p.startsWith('group_')) {
-            return p.substring('group_'.length);
+          try {
+            const initData = tg.initDataUnsafe || {};
+            let p = initData.start_param;
+            if (typeof p === 'string' && p.startsWith('group_')) {
+              return p.substring('group_'.length);
+            }
+            const params = new URLSearchParams(window.location.search);
+            if (params.has('group_id')) {
+              return params.get('group_id');
+            }
+            console.warn('Cannot determine group_id');
+            return null;
+          } catch (e) {
+            console.warn('Cannot determine group_id', e);
+            return null;
           }
-          return p;
-        } catch (e) {
-          console.warn('Cannot parse start_param', e);
-          return null;
         }
-      }
 
       /**
        * Загружает список позиций. Если глобальная переменная POSITIONS
