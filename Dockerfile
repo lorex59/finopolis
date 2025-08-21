@@ -26,12 +26,12 @@ RUN mkdir -p /etc/ssl/certs /etc/ssl/private && \
     openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
         -keyout /etc/ssl/private/privkey.pem \
         -out /etc/ssl/certs/fullchain.pem \
-        -subj "/CN=176-108-244-31.sslip.io"
+        -subj "/CN=176-108-244-31.split.lorex"
 
 COPY nginx.conf /etc/nginx/nginx.conf
 
 EXPOSE 80 443
-ENV BACKEND_URL=https://176-108-244-31.sslip.io
+ENV BACKEND_URL=https://176-108-244-31.split.lorex
 ENV PYTHONPATH="/app/app"
 CMD ["bash", "-c", "python -m app.bot & python -m uvicorn app.webapp:app --host 0.0.0.0 --port 8000 & nginx -g 'daemon off;'"]
 
