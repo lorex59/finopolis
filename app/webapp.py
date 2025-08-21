@@ -75,15 +75,7 @@ async def get_receipt_page(request: Request):
     """
     # Загружаем все позиции из файла (dict[group_id -> list])
     all_positions = load_positions() or {}
-    # Определяем идентификатор группы (чата), для которого нужно загрузить позиции.
-    # В первую очередь берём параметр group_id, переданный в URL напрямую.
     group_id = request.query_params.get('group_id')
-    if not group_id:
-        # Если group_id не указан, пробуем извлечь его из tgWebAppStartParam,
-        # который Telegram передаёт при открытии мини‑приложения через deep‑link.
-        start_param = request.query_params.get('tgWebAppStartParam')
-        if start_param and isinstance(start_param, str) and start_param.startswith('group_'):
-            group_id = start_param[len('group_'):]
     if group_id:
         positions = all_positions.get(str(group_id), [])
     else:
@@ -91,6 +83,31 @@ async def get_receipt_page(request: Request):
         positions = []
     html = render_receipt_page(positions)
     return HTMLResponse(content=html, status_code=200)
+
+# New API endpoint to fetch positions for a given group.
+#
+# When the mini‑application is opened via a deep‑link (startapp) in a group
+# chat, the frontend does not know the group ID ahead of time. It can
+# extract the start parameter from Telegram.WebApp.initDataUnsafe and call
+# this endpoint to retrieve the list of positions for that group on demand.
+@app.get("/webapp/api/positions", response_class=JSONResponse)
+async def api_positions(request: Request):
+    """
+    Return the list of receipt positions for the specified group.
+
+    The group_id should be passed as a query parameter. If group_id is
+    missing or there are no positions stored for that group, an empty
+    list will be returned. The response is a JSON array of objects
+    containing ``name``, ``quantity`` and ``price`` keys.
+    """
+    group_id = request.query_params.get('group_id')
+    # Load all positions from storage and filter by the provided group ID.
+    all_positions = load_positions() or {}
+    if group_id:
+        positions = all_positions.get(str(group_id), [])
+    else:
+        positions = []
+    return JSONResponse(content=positions, status_code=200)
 
 # --- Health helpers ----------------------------------------------------------
 def _check_positions_store() -> dict:

@@ -92,25 +92,70 @@
     <div id="list"></div>
     <!-- Блок с итоговой информацией о выборе -->
     <div id="summary" style="margin-top: 12px; font-weight: bold; text-align: center;"></div>
-      <button id="submit">Отправить</button>
+    <button id="submit">Отправить</button>
     <script>
       /*
-       * Мини‑приложение для выбора позиций
+       * Мини‑приложение для выбора позиций.
        *
-       * Список позиций передаётся сервером через глобальную переменную window.POSITIONS.
-       * Пользователь может выбрать несколько элементов, по каждому из которых
-       * автоматически подсчитывается стоимость (количество × цена). Внизу
-       * отображается суммарная стоимость выбранных позиций и их количество.
+       * В приватных чатах список позиций передаётся сервером через глобальную
+       * переменную window.POSITIONS. В групповых чатах мини‑приложение
+       * запускается через deep‑link с параметром startapp=group_<id>.
+       * На клиенте мы извлекаем group ID из Telegram.WebApp.initDataUnsafe.start_param
+       * и запрашиваем список позиций через API /webapp/api/positions.
        */
-      const positions = window.POSITIONS || [];
-      const listEl = document.getElementById('list');
-      const summaryEl = document.getElementById('summary');
-      // Храним выбранное количество по индексу позиции. По умолчанию пусто.
-      const selectedQuantities = {};
+
+      // Получаем доступ к WebApp API.
+      const tg = Telegram.WebApp;
+
       /**
-       * Пересчитывает количество и сумму выбранных позиций.
+       * Извлекает идентификатор группы из параметра start_param.
+       * Возвращает строку groupId или null, если параметр отсутствует.
        */
-      function updateSummary() {
+      function extractGroupId() {
+        try {
+          const initData = tg.initDataUnsafe || {};
+          let p = initData.start_param;
+          if (!p) return null;
+          // Сравниваем префикс group_
+          if (typeof p === 'string' && p.startsWith('group_')) {
+            return p.substring('group_'.length);
+          }
+          return p;
+        } catch (e) {
+          console.warn('Cannot parse start_param', e);
+          return null;
+        }
+      }
+
+      /**
+       * Загружает список позиций. Если глобальная переменная POSITIONS
+       * уже содержит массив позиций (для приватных чатов), возвращает его.
+       * В противном случае извлекает groupId и запрашивает данные с сервера.
+       */
+      async function getPositions() {
+        if (Array.isArray(window.POSITIONS) && window.POSITIONS.length > 0) {
+          return window.POSITIONS;
+        }
+        const groupId = extractGroupId();
+        if (!groupId) {
+          return [];
+        }
+        try {
+          const response = await fetch(`/webapp/api/positions?group_id=${encodeURIComponent(groupId)}`);
+          if (!response.ok) {
+            return [];
+          }
+          const data = await response.json();
+          if (Array.isArray(data)) return data;
+          return [];
+        } catch (err) {
+          console.error('Error fetching positions', err);
+          return [];
+        }
+      }
+
+      // Функция для пересчёта суммы и количества выбранных позиций.
+      function updateSummary(selectedQuantities, positions, summaryEl) {
         let total = 0;
         let count = 0;
         Object.keys(selectedQuantities).forEach((idx) => {
@@ -122,151 +167,127 @@
             count += qtySelected;
           }
         });
-        // Формируем красивую строку с количеством и суммой
         summaryEl.textContent = count === 0
           ? 'Ничего не выбрано'
           : `Выбрано ${count} ${count === 1 ? 'позиция' : (count < 5 ? 'позиции' : 'позиций')} на сумму ${total.toFixed(2)}₽`;
       }
-      // Создаём элементы списка. Для каждой позиции выводим название, исходное количество,
-      // цену и поле ввода количества, которое пользователь хочет выбрать.
-      positions.forEach((item, idx) => {
-        const el = document.createElement('div');
-        el.className = 'item';
-        // Левая часть: название + исходное количество и цена
-        const infoContainer = document.createElement('div');
-        infoContainer.style.display = 'flex';
-        infoContainer.style.flexDirection = 'column';
-        infoContainer.style.flex = '1';
-        const nameSpan = document.createElement('span');
-        nameSpan.textContent = item.name;
-        const qtyPriceSpan = document.createElement('span');
-        qtyPriceSpan.style.fontSize = '14px';
-        qtyPriceSpan.style.color = '#666';
-        qtyPriceSpan.textContent = `${item.quantity} × ${item.price}₽`;
-        infoContainer.appendChild(nameSpan);
-        infoContainer.appendChild(qtyPriceSpan);
-        el.appendChild(infoContainer);
-        // Правая часть: число (0..item.quantity) и кнопки +/-. Также поддерживаем ввод вручную.
-        const controls = document.createElement('div');
-        controls.className = 'controls';
-        const maxQty = parseFloat(item.quantity) || 1;
-        // Кнопка минус
-        const minusBtn = document.createElement('button');
-        minusBtn.type = 'button';
-        minusBtn.textContent = '–';
-        // Поле ввода
-        const input = document.createElement('input');
-        input.type = 'number';
-        input.min = '0';
-        input.max = String(maxQty);
-        input.step = '1';
-        input.value = '0';
-        // Кнопка плюс
-        const plusBtn = document.createElement('button');
-        plusBtn.type = 'button';
-        plusBtn.textContent = '+';
-        // Функция обновления выбранного количества и подсветки
-        function updateSelection(val) {
-          if (val > 0) {
-            selectedQuantities[idx] = val;
-            el.classList.add('selected');
-          } else {
-            delete selectedQuantities[idx];
-            el.classList.remove('selected');
+
+      // Асинхронная инициализация.
+      (async function init() {
+        const positions = await getPositions();
+        const listEl = document.getElementById('list');
+        const summaryEl = document.getElementById('summary');
+        const selectedQuantities = {};
+        // Заполняем список позиций
+        positions.forEach((item, idx) => {
+          const el = document.createElement('div');
+          el.className = 'item';
+          // Левая часть: название, количество и цена
+          const infoContainer = document.createElement('div');
+          infoContainer.style.display = 'flex';
+          infoContainer.style.flexDirection = 'column';
+          infoContainer.style.flex = '1';
+          const nameSpan = document.createElement('span');
+          nameSpan.textContent = item.name;
+          const qtyPriceSpan = document.createElement('span');
+          qtyPriceSpan.style.fontSize = '14px';
+          qtyPriceSpan.style.color = '#666';
+          qtyPriceSpan.textContent = `${item.quantity} × ${item.price}₽`;
+          infoContainer.appendChild(nameSpan);
+          infoContainer.appendChild(qtyPriceSpan);
+          el.appendChild(infoContainer);
+          // Правая часть: кнопки +/‑ и поле ввода
+          const controls = document.createElement('div');
+          controls.className = 'controls';
+          const maxQty = parseFloat(item.quantity) || 1;
+          const minusBtn = document.createElement('button');
+          minusBtn.type = 'button';
+          minusBtn.textContent = '–';
+          const input = document.createElement('input');
+          input.type = 'number';
+          input.min = '0';
+          input.max = String(maxQty);
+          input.step = '1';
+          input.value = '0';
+          const plusBtn = document.createElement('button');
+          plusBtn.type = 'button';
+          plusBtn.textContent = '+';
+          function updateSelection(val) {
+            if (val > 0) {
+              selectedQuantities[idx] = val;
+              el.classList.add('selected');
+            } else {
+              delete selectedQuantities[idx];
+              el.classList.remove('selected');
+            }
           }
-        }
-        // Обработчики кнопок
-        minusBtn.addEventListener('click', (ev) => {
-          ev.stopPropagation();
-          let val = parseInt(input.value) || 0;
-          if (val > 0) {
-            val--;
+          minusBtn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            let val = parseInt(input.value) || 0;
+            if (val > 0) {
+              val--;
+              input.value = String(val);
+              updateSelection(val);
+              updateSummary(selectedQuantities, positions, summaryEl);
+            }
+          });
+          plusBtn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            let val = parseInt(input.value) || 0;
+            if (val < maxQty) {
+              val++;
+              input.value = String(val);
+              updateSelection(val);
+              updateSummary(selectedQuantities, positions, summaryEl);
+            }
+          });
+          input.addEventListener('input', () => {
+            let val = parseInt(input.value) || 0;
+            if (val < 0) val = 0;
+            if (val > maxQty) val = maxQty;
             input.value = String(val);
             updateSelection(val);
-            updateSummary();
-          }
+            updateSummary(selectedQuantities, positions, summaryEl);
+          });
+          el.addEventListener('click', (ev) => {
+            if (ev.target === minusBtn || ev.target === plusBtn || ev.target === input) {
+              return;
+            }
+            let val = parseInt(input.value) || 0;
+            if (val < maxQty) {
+              val++;
+              input.value = String(val);
+              updateSelection(val);
+              updateSummary(selectedQuantities, positions, summaryEl);
+            }
+          });
+          controls.appendChild(minusBtn);
+          controls.appendChild(input);
+          controls.appendChild(plusBtn);
+          el.appendChild(controls);
+          listEl.appendChild(el);
         });
-        plusBtn.addEventListener('click', (ev) => {
-          ev.stopPropagation();
-          let val = parseInt(input.value) || 0;
-          if (val < maxQty) {
-            val++;
-            input.value = String(val);
-            updateSelection(val);
-            updateSummary();
+        // Инициализируем отображение
+        updateSummary(selectedQuantities, positions, summaryEl);
+        // Отправляем данные обратно в бота
+        document.getElementById('submit').addEventListener('click', () => {
+          const payload = {};
+          Object.keys(selectedQuantities).forEach((idx) => {
+            const qty = parseFloat(selectedQuantities[idx]) || 0;
+            if (qty > 0) {
+              payload[idx] = qty;
+            }
+          });
+          const groupId = extractGroupId();
+          // Включаем groupId в отправляемые данные, если оно определено.
+          const data = { selected: payload };
+          if (groupId) {
+            data.group_id = groupId;
           }
+          tg.sendData(JSON.stringify(data));
+          tg.close();
         });
-        // Обработчик изменения вручную
-        input.addEventListener('input', () => {
-          let val = parseInt(input.value) || 0;
-          if (val < 0) val = 0;
-          if (val > maxQty) val = maxQty;
-          input.value = String(val);
-          updateSelection(val);
-          updateSummary();
-        });
-        // Клик по всей строке увеличивает количество на 1 (если не клик по элементам управления)
-        el.addEventListener('click', (ev) => {
-          if (ev.target === minusBtn || ev.target === plusBtn || ev.target === input) {
-            return;
-          }
-          let val = parseInt(input.value) || 0;
-          if (val < maxQty) {
-            val++;
-            input.value = String(val);
-            updateSelection(val);
-            updateSummary();
-          }
-        });
-        controls.appendChild(minusBtn);
-        controls.appendChild(input);
-        controls.appendChild(plusBtn);
-        el.appendChild(controls);
-        listEl.appendChild(el);
-      });
-      // Инициализируем отображение
-      updateSummary();
-      // ----------------------------------------------------------------------
-      // При отправке формируем объект, где key — индекс позиции, value — выбранное количество.
-      // Дополнительно передаём идентификатор группы (group_id), чтобы бот мог
-      // сопоставить выбор пользователя с нужным чатом. В зависимости от того,
-      // как было открыто мини‑приложение, group_id можно получить либо из
-      // параметров URL (?group_id=...), либо из Telegram.WebApp.initDataUnsafe.start_param.
-      document.getElementById('submit').addEventListener('click', () => {
-        const payload = {};
-        Object.keys(selectedQuantities).forEach((idx) => {
-          const qty = parseFloat(selectedQuantities[idx]) || 0;
-          if (qty > 0) {
-            payload[idx] = qty;
-          }
-        });
-        // Определяем group_id. Сначала пробуем параметр group_id в URL, затем
-        // start_param, который передаётся через deep‑link (?startapp=group_<id>).
-        let groupId = null;
-        try {
-          const params = new URLSearchParams(window.location.search);
-          groupId = params.get('group_id');
-        } catch (e) {
-          groupId = null;
-        }
-        // Если groupId не найден в query, пытаемся разобрать start_param из initData.
-        try {
-          const initData = Telegram?.WebApp?.initDataUnsafe || {};
-          const startParam = initData.start_param || initData.startParam;
-          if (!groupId && typeof startParam === 'string' && startParam.startsWith('group_')) {
-            groupId = startParam.slice('group_'.length);
-          }
-        } catch (e) {
-          // ignore
-        }
-        // Формируем итоговый объект. Включаем group_id, если он найден.
-        const dataToSend = { selected: payload };
-        if (groupId) {
-          dataToSend.group_id = groupId;
-        }
-        Telegram.WebApp.sendData(JSON.stringify(dataToSend));
-        Telegram.WebApp.close();
-      });
+      })();
     </script>
   </body>
 </html>

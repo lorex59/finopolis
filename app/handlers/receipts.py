@@ -56,6 +56,7 @@ async def cmd_split(msg: Message):
         return
     try:
         # Формируем URL для мини‑приложения, добавляя идентификатор группы.
+        print(f"Type { msg.chat.type}")
         webapp_url = f"{settings.backend_url}/webapp/receipt?group_id={msg.chat.id}"
         # В приватном чате можно отправлять WebApp-кнопку на обычной клавиатуре. В группах используем deep‑link.
         if msg.chat.type == "private":
@@ -74,6 +75,7 @@ async def cmd_split(msg: Message):
             if settings.bot_username:
                 payload = f"group_{msg.chat.id}"
                 deep_link = f"https://t.me/{settings.bot_username}?startapp={payload}"
+                print(deep_link)
                 kb = InlineKeyboardMarkup(
                     inline_keyboard=[[InlineKeyboardButton(text="🧾 Разделить чек", url=deep_link)]]
                 )
@@ -259,13 +261,10 @@ async def handle_web_app_data(msg: Message):
     try:
         import json
         print(f"Received web_app_data: {msg.web_app_data.data}")
-        data = json.loads(msg.web_app_data.data or '{}')
-        # group_id может быть передан из мини‑приложения для группового разделения. Если его нет,
-        # используем chat.id (актуально для приватных чатов).
-        group_id = str(data.get('group_id') or msg.chat.id)
+        data = json.loads(msg.web_app_data.data)
         selected_data = data.get("selected", {})
         indices: list[int] = []
-        # selected может быть словарём {index: quantity} или списком индексов.
+        # Если selected — словарь {index: quantity}, формируем список индексов с повторениями
         if isinstance(selected_data, dict):
             for idx_str, qty in selected_data.items():
                 try:
@@ -276,6 +275,7 @@ async def handle_web_app_data(msg: Message):
                 for _ in range(max(q, 0)):
                     indices.append(idx)
         elif isinstance(selected_data, list):
+            # Старый формат: просто список индексов
             for i in selected_data:
                 try:
                     indices.append(int(i))
@@ -283,15 +283,21 @@ async def handle_web_app_data(msg: Message):
                     pass
         else:
             indices = []
-        print(f"Received indices from WebApp: {indices}, group_id: {group_id}")
+        print(f"Received indices from WebApp: {indices}")
     except Exception as e:
         await msg.answer(f"Ошибка обработки данных из мини‑приложения: {e}")
         return
-    # Сохраняем выбор пользователя для данного чека (group_id).
-    receipt_id = str(group_id)
+    # When the mini‑app is opened via a deep‑link in a group, the message
+    # containing the selection is sent from the user's private chat. To
+    # correctly associate the selection with the original group, we look
+    # for a "group_id" field in the received data. If absent, fall back
+    # to using the current chat ID (suitable for private chat usage).
+    group_id = str(data.get("group_id") or msg.chat.id)
+    receipt_id = group_id
     set_assignment(receipt_id, msg.from_user.id, indices)
     try:
-        all_positions = get_positions(group_id)
+        # Retrieve all positions for the identified group. Use list from storage.
+        all_positions = get_positions(str(group_id))
         selected_positions: list[dict] = []
         if isinstance(selected_data, dict):
             for idx_str, qty in selected_data.items():
@@ -308,7 +314,7 @@ async def handle_web_app_data(msg: Message):
                 if 0 <= idx < len(all_positions):
                     orig = all_positions[idx]
                     selected_positions.append({"name": orig.get("name"), "quantity": 1, "price": orig.get("price")})
-        save_selected_positions(group_id, msg.from_user.id, selected_positions)
+        save_selected_positions(str(group_id), msg.from_user.id, selected_positions)
     except Exception as e:
         print(f"Ошибка при сохранении распределённых позиций: {e}")
     await msg.answer(
