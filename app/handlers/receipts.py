@@ -248,77 +248,58 @@ async def handle_photo(msg: Message):
         print(f"Ошибка при отправке кнопки WebApp: {e}")
 
 
-@router.message(lambda m: getattr(m, 'web_app_data', None) is not None)
+@router.message(F.web_app_data)
 async def handle_web_app_data(msg: Message):
-    """
-    Обработчик данных, присылаемых из WebApp. telegram.web_app_data.data содержит строку JSON,
-    которую нужно распарсить. Предполагаем, что она имеет структуру
-    {"selected": [0, 3, 5]} или {"selected": {index: quantity}} — индексы позиций, которые выбрал пользователь.
-    Храним выбор в БД и сохраняем агрегированный список позиций по группе.
-    """
+    import json
     try:
-        import json
-        print(f"Received web_app_data: {msg.web_app_data.data}")
-        data = json.loads(msg.web_app_data.data)
-        selected_data = data.get("selected", {})
-        indices: list[int] = []
-        # Если selected — словарь {index: quantity}, формируем список индексов с повторениями
-        if isinstance(selected_data, dict):
-            for idx_str, qty in selected_data.items():
-                try:
-                    idx = int(idx_str)
-                    q = int(float(qty))
-                except Exception:
-                    continue
-                for _ in range(max(q, 0)):
-                    indices.append(idx)
-        elif isinstance(selected_data, list):
-            # Старый формат: просто список индексов
-            for i in selected_data:
-                try:
-                    indices.append(int(i))
-                except Exception:
-                    pass
-        else:
-            indices = []
-        print(f"Received indices from WebApp: {indices}")
+        payload = msg.web_app_data.data
+        data = json.loads(payload)
     except Exception as e:
-        await msg.answer(f"Ошибка обработки данных из мини‑приложения: {e}")
+        await msg.answer(f"Ошибка обработки данных из мини-приложения: {e}")
         return
-    # When the mini‑app is opened via a deep‑link in a group, the message
-    # containing the selection is sent from the user's private chat. To
-    # correctly associate the selection with the original group, we look
-    # for a "group_id" field in the received data. If absent, fall back
-    # to using the current chat ID (suitable for private chat usage).
+
+    selected_data = data.get("selected", {})
+    indices: list[int] = []
+    if isinstance(selected_data, dict):
+        for idx_str, qty in selected_data.items():
+            try:
+                idx = int(idx_str); q = int(float(qty))
+                indices.extend([idx] * max(q, 0))
+            except Exception:
+                continue
+    elif isinstance(selected_data, list):
+        for i in selected_data:
+            try: indices.append(int(i))
+            except Exception: pass
+
     group_id = str(data.get("group_id") or msg.chat.id)
     receipt_id = group_id
+
     set_assignment(receipt_id, msg.from_user.id, indices)
+
     try:
-        # Retrieve all positions for the identified group. Use list from storage.
-        all_positions = get_positions(str(group_id))
+        all_positions = get_positions(group_id) or []
         selected_positions: list[dict] = []
         if isinstance(selected_data, dict):
             for idx_str, qty in selected_data.items():
-                try:
-                    idx = int(idx_str)
-                    q = int(float(qty))
-                except Exception:
-                    continue
+                idx = int(idx_str); q = int(float(qty))
                 if 0 <= idx < len(all_positions) and q > 0:
                     orig = all_positions[idx]
-                    selected_positions.append({"name": orig.get("name"), "quantity": q, "price": orig.get("price")})
+                    selected_positions.append({"name": orig.get("name"),
+                                               "quantity": q,
+                                               "price": orig.get("price")})
         else:
             for idx in indices:
                 if 0 <= idx < len(all_positions):
                     orig = all_positions[idx]
-                    selected_positions.append({"name": orig.get("name"), "quantity": 1, "price": orig.get("price")})
-        save_selected_positions(str(group_id), msg.from_user.id, selected_positions)
+                    selected_positions.append({"name": orig.get("name"),
+                                               "quantity": 1,
+                                               "price": orig.get("price")})
+        save_selected_positions(group_id, msg.from_user.id, selected_positions)
     except Exception as e:
         print(f"Ошибка при сохранении распределённых позиций: {e}")
-    await msg.answer(
-        "✅ Ваш выбор сохранён! Когда все участники отметят свои позиции, используйте /finalize для расчёта."
-    )
 
+    await msg.answer("✅ Ваш выбор сохранён! Когда все участники отметят свои позиции, используйте /finalize для расчёта.")
 
 
 @router.message(Command("show"))
