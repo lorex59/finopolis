@@ -282,12 +282,10 @@
           const groupId = extractGroupId();
           const userId = (tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) || null;
           // Подготовим данные для отправки
+          // Базовые данные, которые отправим: выбор и group_id
           const data = { selected: payload };
           if (groupId) {
             data.group_id = groupId;
-          }
-          if (userId) {
-            data.user_id = userId;
           }
           /*
            * Отправляем выбранные позиции. Если mini‑приложение запущено через клавиатурную
@@ -298,12 +296,17 @@
            * отправляем JSON через fetch; иначе используем sendData.
            */
           const hasStartParam = tg.initDataUnsafe && tg.initDataUnsafe.start_param;
-          if (hasStartParam) {
-            // mini‑app запущено по прямой ссылке — отправляем данные на свой backend
-            fetch('/webapp/api/submit_selection', {
+          const chatType = tg.initDataUnsafe && tg.initDataUnsafe.chat_type;
+          // Мини‑приложение, запущенное по ссылке (start_param или chat_type group/supergroup)
+          const useBackend = hasStartParam || (chatType && chatType !== 'private');
+          if (useBackend) {
+            // Подписываем запрос с помощью initData для последующей валидации на сервере
+            const authString = tg.initData || '';
+            const payloadBody = { ...data, _auth: authString };
+            fetch('/webapp/api/submit', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(data),
+              body: JSON.stringify(payloadBody),
             })
               .catch((err) => {
                 console.error('Error submitting selection', err);
@@ -312,7 +315,7 @@
                 tg.close();
               });
           } else {
-            // стандартный механизм через sendData — бот получит web_app_data
+            // Стандартный механизм через sendData — бот получит web_app_data
             tg.sendData(JSON.stringify(data));
             tg.close();
           }

@@ -23,6 +23,8 @@ from app.database import (
     set_assignment,
     save_selected_positions,
 )
+from aiogram.utils.web_app import safe_parse_webapp_init_data
+from config import settings
 
 import os, time  # ⬅ добавили
 app = FastAPI()
@@ -122,38 +124,42 @@ async def api_positions(request: Request):
 # selected_positions tables. The payload must include `group_id`,
 # `user_id` and a `selected` mapping (index → quantity) or list.
 
-@app.post("/webapp/api/submit_selection", response_class=JSONResponse)
+@app.post("/webapp/api/submit", response_class=JSONResponse)
 async def submit_selection(request: Request):
     """
-    Accept selection data from a Mini App and persist it.
+    Accept selection data from a Mini App launched via deep‑link and persist it.
 
-    Expected JSON body:
-        {
-            "group_id": "<chat id>",
-            "user_id": <telegram user id>,
-            "selected": {"0": 2, "3": 1}  // index → quantity
-        }
+    The request body must contain:
+        - `_auth`: the initData string from Telegram WebApp (required for validation)
+        - `group_id`: the chat ID that corresponds to the receipt (string or int)
+        - `selected`: mapping of index → quantity or list of indices
 
-    If `selected` is provided as a list, each element will be treated as one
-    selected position with quantity 1. The response always returns
-    `{ "status": "ok" }` on success or `{ "error": "..." }` on failure.
+    Upon successful validation and saving, the function returns `{"status": "ok"}`.
+    If validation fails or required fields are missing, an error JSON is returned.
     """
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-
-    group_id = body.get("group_id")
-    user_id = body.get("user_id")
-    selected_data = body.get("selected", {})
-    if not group_id or user_id is None:
-        return JSONResponse({"error": "Missing group_id or user_id"}, status_code=400)
-    # Normalize group_id and user_id types
-    group_id_str = str(group_id)
+    # Extract and validate auth string
+    init_data = body.get("_auth")
+    if not init_data:
+        return JSONResponse({"error": "Missing _auth"}, status_code=400)
     try:
-        user_id_int = int(user_id)
+        # Validate the init data using the bot token
+        parsed = safe_parse_webapp_init_data(init_data, bot_token=settings.bot_token)
     except Exception:
-        return JSONResponse({"error": "Invalid user_id"}, status_code=400)
+        return JSONResponse({"error": "Invalid _auth"}, status_code=403)
+    user = parsed.user
+    if user is None:
+        return JSONResponse({"error": "Invalid user"}, status_code=403)
+    # Determine group_id and selected data
+    group_id = body.get("group_id")
+    selected_data = body.get("selected", {})
+    if not group_id:
+        return JSONResponse({"error": "Missing group_id"}, status_code=400)
+    group_id_str = str(group_id)
+    user_id_int = user.id
     # Build list of indices from selected_data
     indices: list[int] = []
     if isinstance(selected_data, dict):
@@ -171,10 +177,9 @@ async def submit_selection(request: Request):
                 indices.append(int(i))
             except Exception:
                 pass
-    # Persist assignment in in‑memory mapping
+    # Persist assignment and detailed positions
     try:
         set_assignment(group_id_str, user_id_int, indices)
-        # Prepare detailed positions for storage: fetch original positions
         all_positions = get_positions(group_id_str)
         selected_positions: list[dict] = []
         if isinstance(selected_data, dict):
@@ -202,7 +207,6 @@ async def submit_selection(request: Request):
                     })
         save_selected_positions(group_id_str, user_id_int, selected_positions)
     except Exception as e:
-        # In case of any error, return failure
         return JSONResponse({"error": str(e)}, status_code=500)
     return JSONResponse({"status": "ok"}, status_code=200)
 
