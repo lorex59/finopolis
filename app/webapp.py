@@ -17,6 +17,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from jinja2 import Template
 import logging
+from urllib.parse import unquote_plus, parse_qsl, urlencode
 
 from app.database import load_positions
 from app.database import (
@@ -149,18 +150,12 @@ async def api_positions(request: Request):
 # selected_positions tables. The payload must include `group_id`,
 # `user_id` and a `selected` mapping (index → quantity) or list.
 
+
 @app.post("/webapp/api/submit", response_class=JSONResponse)
 async def submit_selection(request: Request):
     """
-    Accept selection data from a Mini App launched via deep‑link and persist it.
-
-    The request body must contain:
-        - `_auth`: the initData string from Telegram WebApp (required for validation)
-        - `group_id`: the chat ID that corresponds to the receipt (string or int)
-        - `selected`: mapping of index → quantity or list of indices
-
-    Upon successful validation and saving, the function returns `{"status": "ok"}`.
-    If validation fails or required fields are missing, an error JSON is returned.
+    Принимает выбор позиций из Mini App, валидирует initData и сохраняет
+    assignment + выбранные позиции.
     """
     try:
         body = await request.json()
@@ -168,57 +163,65 @@ async def submit_selection(request: Request):
     except Exception as e:
         logger.error("Ошибка парсинга JSON: %s", e, exc_info=True)
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-    # Extract and validate auth string
-    init_data: str | None = body.get("_auth")
-    if not init_data:
+
+    # --- Извлекаем и нормализуем initData (_auth) ---
+    init_data_raw = body.get("_auth")
+    if not init_data_raw:
         logger.warning("Запрос без _auth")
         return JSONResponse({"error": "Missing _auth"}, status_code=400)
-    # Try to validate the init data using the official aiogram helper. If it
-    # raises an exception we attempt to parse the necessary fields manually.
+
+    try:
+        decoded = unquote_plus(init_data_raw)  # %7B → {
+        allowed_keys = {
+            "query_id", "user", "receiver", "chat", "chat_type", "chat_instance",
+            "start_param", "can_send_after", "auth_date", "hash"
+        }
+        pairs = [(k, v) for k, v in parse_qsl(decoded, keep_blank_values=True) if k in allowed_keys]
+        normalized_init_data = urlencode(pairs, doseq=True)
+    except Exception as e:
+        logger.error("Невозможно нормализовать _auth: %s", e, exc_info=True)
+        return JSONResponse({"error": "Invalid _auth"}, status_code=403)
+
+    # --- Валидируем initData ---
     parsed = None
     try:
-        parsed = safe_parse_webapp_init_data(init_data, bot_token=settings.bot_token)
+        parsed = safe_parse_webapp_init_data(normalized_init_data, bot_token=settings.bot_token)
     except Exception as err:
-        logger.warning("safe_parse_webapp_init_data raised an error: %s", err)
-        # Manual fallback: extract the JSON‑encoded user field from the query string.
+        logger.warning("safe_parse_webapp_init_data error: %s", err)
+
+    # --- Фоллбек: достаём user.id вручную ---
+    if not parsed or getattr(parsed, "user", None) is None:
         try:
-            # Parse query string into a dict. ``keep_blank_values`` ensures keys with
-            # empty values are preserved.
-            qs = urllib.parse.parse_qs(init_data, keep_blank_values=True)
-            user_data_encoded = qs.get('user', [None])[0]
-            if user_data_encoded:
-                # The value is URL‑encoded JSON, decode it and load as dict.
-                user_json = urllib.parse.unquote(user_data_encoded)
+            qs = dict(parse_qsl(decoded, keep_blank_values=True))
+            user_json = qs.get("user")
+            u_id = None
+            if user_json:
                 user_dict = json.loads(user_json)
-                u_id = user_dict.get('id')
-                # Build lightweight objects mimicking aiogram types
-                class _User:
-                    def __init__(self, id_val: int | None):
-                        self.id = id_val
-                class _Parsed:
-                    def __init__(self, user_obj):
-                        self.user = user_obj
-                parsed = _Parsed(_User(u_id))
-            else:
-                parsed = None
+                u_id = user_dict.get("id")
+
+            class _User:
+                def __init__(self, id_val): self.id = id_val
+            class _Parsed:
+                def __init__(self, user_obj): self.user = user_obj
+
+            parsed = _Parsed(_User(u_id))
         except Exception as parse_err:
             logger.error("Fallback _auth parsing failed: %s", parse_err, exc_info=True)
-            parsed = None
-    # Ensure we have a parsed object with a user attribute
-    if not parsed or getattr(parsed, 'user', None) is None:
-        return JSONResponse({"error": "Invalid _auth"}, status_code=403)
+            return JSONResponse({"error": "Invalid _auth"}, status_code=403)
+
     user = parsed.user
-    # Determine group_id and selected data
+    user_id_int = getattr(user, "id", None)
+    if user_id_int is None:
+        logger.warning("В _auth отсутствует user.id (decoded=%r)", decoded[:512])
+        return JSONResponse({"error": "Invalid user"}, status_code=403)
+
+    # --- Получаем group_id и выбор пользователя ---
     group_id = body.get("group_id")
-    selected_data = body.get("selected", {})
     if not group_id:
         return JSONResponse({"error": "Missing group_id"}, status_code=400)
     group_id_str = str(group_id)
-    # user.id may be None if parsing failed; treat such case as error
-    user_id_int = getattr(user, 'id', None)
-    if user_id_int is None:
-        return JSONResponse({"error": "Invalid user"}, status_code=403)
-    # Build list of indices from selected_data
+
+    selected_data = body.get("selected", {})
     indices: list[int] = []
     if isinstance(selected_data, dict):
         for idx_str, qty in selected_data.items():
@@ -235,10 +238,12 @@ async def submit_selection(request: Request):
                 indices.append(int(i))
             except Exception:
                 pass
-    # Persist assignment and detailed positions
+
+    # --- Сохраняем assignment и выбранные позиции ---
     try:
         logger.debug("Сохраняем assignment: %s", indices)
         set_assignment(group_id_str, user_id_int, indices)
+
         all_positions = get_positions(group_id_str)
         selected_positions: list[dict] = []
         if isinstance(selected_data, dict):
@@ -269,7 +274,9 @@ async def submit_selection(request: Request):
     except Exception as e:
         logger.error("Ошибка сохранения данных: %s", e, exc_info=True)
         return JSONResponse({"error": str(e)}, status_code=500)
+
     return JSONResponse({"status": "ok"}, status_code=200)
+
 
 # --- Health helpers ----------------------------------------------------------
 def _check_positions_store() -> dict:

@@ -309,17 +309,26 @@
             const submitUrl = (typeof BACKEND_URL !== 'undefined' && BACKEND_URL)
               ? `${BACKEND_URL}/webapp/api/submit`
               : '/webapp/api/submit';
-            fetch(submitUrl, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(payloadBody),
-            })
-              .catch((err) => {
-                console.error('Error submitting selection', err);
-              })
-              .finally(() => {
-                tg.close();
+            (async () => {
+            try {
+              const resp = await fetch(submitUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payloadBody),
               });
+              if (!resp.ok) {
+                const errText = await resp.text().catch(() => '');
+                console.error('Submit failed', resp.status, errText);
+                tg.showAlert('Не удалось сохранить выбор. Попробуйте ещё раз.');
+                return;
+              }
+              tg.showAlert('Готово! Выбор сохранён.');
+              tg.close();
+            } catch (e) {
+              console.error('Error submitting selection', e);
+              tg.showAlert('Ошибка сети. Проверьте интернет и попробуйте снова.');
+            }
+          })();
           } else {
             // Стандартный механизм через sendData — бот получит web_app_data
             tg.sendData(JSON.stringify(data));
