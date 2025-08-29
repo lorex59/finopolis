@@ -18,6 +18,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from jinja2 import Template
 
 from app.database import load_positions
+from app.database import (
+    get_positions,
+    set_assignment,
+    save_selected_positions,
+)
 
 import os, time  # ⬅ добавили
 app = FastAPI()
@@ -108,6 +113,98 @@ async def api_positions(request: Request):
     else:
         positions = []
     return JSONResponse(content=positions, status_code=200)
+
+# ---------------------------------------------------------------------------
+# Endpoint to accept selection data from Mini App opened via deep‑link.
+# When a Mini App is launched using a startapp link, Telegram does not
+# deliver WebAppData messages back to the bot. To persist the user's
+# selection we accept it directly here and update the assignments and
+# selected_positions tables. The payload must include `group_id`,
+# `user_id` and a `selected` mapping (index → quantity) or list.
+
+@app.post("/webapp/api/submit_selection", response_class=JSONResponse)
+async def submit_selection(request: Request):
+    """
+    Accept selection data from a Mini App and persist it.
+
+    Expected JSON body:
+        {
+            "group_id": "<chat id>",
+            "user_id": <telegram user id>,
+            "selected": {"0": 2, "3": 1}  // index → quantity
+        }
+
+    If `selected` is provided as a list, each element will be treated as one
+    selected position with quantity 1. The response always returns
+    `{ "status": "ok" }` on success or `{ "error": "..." }` on failure.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    group_id = body.get("group_id")
+    user_id = body.get("user_id")
+    selected_data = body.get("selected", {})
+    if not group_id or user_id is None:
+        return JSONResponse({"error": "Missing group_id or user_id"}, status_code=400)
+    # Normalize group_id and user_id types
+    group_id_str = str(group_id)
+    try:
+        user_id_int = int(user_id)
+    except Exception:
+        return JSONResponse({"error": "Invalid user_id"}, status_code=400)
+    # Build list of indices from selected_data
+    indices: list[int] = []
+    if isinstance(selected_data, dict):
+        for idx_str, qty in selected_data.items():
+            try:
+                idx = int(idx_str)
+                q = int(float(qty))
+            except Exception:
+                continue
+            for _ in range(max(q, 0)):
+                indices.append(idx)
+    elif isinstance(selected_data, list):
+        for i in selected_data:
+            try:
+                indices.append(int(i))
+            except Exception:
+                pass
+    # Persist assignment in in‑memory mapping
+    try:
+        set_assignment(group_id_str, user_id_int, indices)
+        # Prepare detailed positions for storage: fetch original positions
+        all_positions = get_positions(group_id_str)
+        selected_positions: list[dict] = []
+        if isinstance(selected_data, dict):
+            for idx_str, qty in selected_data.items():
+                try:
+                    idx = int(idx_str)
+                    q = int(float(qty))
+                except Exception:
+                    continue
+                if 0 <= idx < len(all_positions) and q > 0:
+                    orig = all_positions[idx]
+                    selected_positions.append({
+                        "name": orig.get("name"),
+                        "quantity": q,
+                        "price": orig.get("price"),
+                    })
+        else:
+            for idx in indices:
+                if 0 <= idx < len(all_positions):
+                    orig = all_positions[idx]
+                    selected_positions.append({
+                        "name": orig.get("name"),
+                        "quantity": 1,
+                        "price": orig.get("price"),
+                    })
+        save_selected_positions(group_id_str, user_id_int, selected_positions)
+    except Exception as e:
+        # In case of any error, return failure
+        return JSONResponse({"error": str(e)}, status_code=500)
+    return JSONResponse({"status": "ok"}, status_code=200)
 
 # --- Health helpers ----------------------------------------------------------
 def _check_positions_store() -> dict:

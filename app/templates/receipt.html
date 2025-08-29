@@ -271,6 +271,7 @@
         updateSummary(selectedQuantities, positions, summaryEl);
         // Отправляем данные обратно в бота
         document.getElementById('submit').addEventListener('click', () => {
+          // Формируем объект выбранных позиций: index → quantity
           const payload = {};
           Object.keys(selectedQuantities).forEach((idx) => {
             const qty = parseFloat(selectedQuantities[idx]) || 0;
@@ -279,13 +280,42 @@
             }
           });
           const groupId = extractGroupId();
-          // Включаем groupId в отправляемые данные, если оно определено.
+          const userId = (tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) || null;
+          // Подготовим данные для отправки
           const data = { selected: payload };
           if (groupId) {
             data.group_id = groupId;
           }
-          tg.sendData(JSON.stringify(data));
-          tg.close();
+          if (userId) {
+            data.user_id = userId;
+          }
+          /*
+           * Отправляем выбранные позиции. Если mini‑приложение запущено через клавиатурную
+           * кнопку (reply‑keyboard), Telegram позволяет использовать WebApp.sendData(),
+           * и бот получит сообщение с web_app_data. Для deep‑link (startapp=...) такая
+           * возможность отсутствует, поэтому данные нужно отправлять напрямую на
+           * backend-сервер. Проверяем наличие start_param: если он присутствует,
+           * отправляем JSON через fetch; иначе используем sendData.
+           */
+          const hasStartParam = tg.initDataUnsafe && tg.initDataUnsafe.start_param;
+          if (hasStartParam) {
+            // mini‑app запущено по прямой ссылке — отправляем данные на свой backend
+            fetch('/webapp/api/submit_selection', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(data),
+            })
+              .catch((err) => {
+                console.error('Error submitting selection', err);
+              })
+              .finally(() => {
+                tg.close();
+              });
+          } else {
+            // стандартный механизм через sendData — бот получит web_app_data
+            tg.sendData(JSON.stringify(data));
+            tg.close();
+          }
         });
       })();
     </script>
