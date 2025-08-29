@@ -67,9 +67,17 @@ def render_receipt_page(positions: list[dict]) -> str:
     if "const positions =" in html:
         html = html.replace("const positions = window.POSITIONS || [];", replacement)
     else:
-        # В качестве резервного варианта добавим инъекцию в head
         injection = f"<script>window.POSITIONS = {positions_json};</script>"
         html = html.replace("</head>", f"{injection}\n</head>")
+    # Также инжектируем BACKEND_URL, чтобы клиентский код мог обращаться к нашему API
+    try:
+        from config import settings as _settings
+        backend_url = _settings.backend_url
+    except Exception:
+        backend_url = ""
+    if backend_url:
+        backend_injection = f"<script>const BACKEND_URL = '{backend_url}';</script>"
+        html = html.replace("</head>", f"{backend_injection}\n</head>")
     return html
 
 

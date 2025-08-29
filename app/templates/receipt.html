@@ -303,7 +303,13 @@
             // Подписываем запрос с помощью initData для последующей валидации на сервере
             const authString = tg.initData || '';
             const payloadBody = { ...data, _auth: authString };
-            fetch('/webapp/api/submit', {
+            // Определяем URL для отправки: используем глобальную переменную BACKEND_URL,
+            // если она определена (вставляется сервером через render_receipt_page). Иначе
+            // падёмся на относительный путь (когда страница загружена с backend'а напрямую).
+            const submitUrl = (typeof BACKEND_URL !== 'undefined' && BACKEND_URL)
+              ? `${BACKEND_URL}/webapp/api/submit`
+              : '/webapp/api/submit';
+            fetch(submitUrl, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payloadBody),
