@@ -130,7 +130,6 @@ async def cmd_show_position(msg: Message):
         lines.append(f"{name} ({user_id}): {items_str}")
     await msg.answer("\n".join(lines), parse_mode="HTML")
 
-
 @router.message(F.photo)
 async def handle_photo(msg: Message):
     """
