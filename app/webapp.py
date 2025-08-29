@@ -107,7 +107,7 @@ async def submit_selection(request: Request):
         return JSONResponse({"error": "Missing _auth"}, status_code=400)
 
     try:
-        parsed = safe_parse_webapp_init_data(init_data, bot_token=settings.bot_token)
+        parsed = safe_parse_webapp_init_data(init_data, token=settings.bot_token)
         user = parsed.user
     except Exception as e:
         logger.error("Ошибка проверки _auth: %s", e, exc_info=True)
