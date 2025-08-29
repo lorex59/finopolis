@@ -250,7 +250,14 @@ async def handle_photo(msg: Message):
         print(f"Ошибка при отправке кнопки WebApp: {e}")
 
 
-@router.message(lambda m: getattr(m, 'web_app_data', None) is not None)
+# Обработчик данных, отправляемых из мини‑приложения. Aiogram предоставляет
+# встроенный фильтр ``F.web_app_data``, который срабатывает, если объект
+# ``Message`` содержит поле ``web_app_data``. Ранее использовалось
+# лямбда‑выражение с ``getattr``, однако в некоторых версиях Aiogram оно
+# некорректно отрабатывало и не вызывало хендлер, из‑за чего данные
+# мини‑приложения не доходили до бота. Используем штатный фильтр для
+# надёжной обработки.
+@router.message(F.web_app_data)
 async def handle_web_app_data(msg: Message):
     """
     Обработчик данных, присылаемых из WebApp. telegram.web_app_data.data содержит строку JSON,
@@ -260,11 +267,18 @@ async def handle_web_app_data(msg: Message):
     """
     try:
         import json
-        print(f"Received web_app_data: {msg.web_app_data.data}")
-        data = json.loads(msg.web_app_data.data)
+        # Данные из мини‑приложения приходят в виде строки JSON. Сначала
+        # распарсим их, чтобы достать структуру выбранных позиций. В случае
+        # невалидного JSON выведем ошибку пользователю.
+        raw_data = msg.web_app_data.data
+        print(f"Received web_app_data: {raw_data}")
+        data = json.loads(raw_data)
         selected_data = data.get("selected", {})
         indices: list[int] = []
-        # Если selected — словарь {index: quantity}, формируем список индексов с повторениями
+        # Поддерживаем два формата передачи: список индексов (старый) и
+        # словарь index → quantity (современный интерфейс). Для словаря
+        # разворачиваем количество в список индексов, чтобы далее считать
+        # стоимость пользователя по каждому выбранному товару.
         if isinstance(selected_data, dict):
             for idx_str, qty in selected_data.items():
                 try:
@@ -275,7 +289,7 @@ async def handle_web_app_data(msg: Message):
                 for _ in range(max(q, 0)):
                     indices.append(idx)
         elif isinstance(selected_data, list):
-            # Старый формат: просто список индексов
+            # Формат {selected: [0,1,2]}
             for i in selected_data:
                 try:
                     indices.append(int(i))
@@ -350,10 +364,12 @@ async def delete_position(call: CallbackQuery):
     set_positions(group_id, positions)
     await call.answer("Позиция удалена")
     # Обновить сообщение:
+    # Формируем текст со списком оставшихся позиций. Используем индексы
+    # из enumerate для корректной нумерации и обращаемся к ключам
+    # словаря, так как позиция представлена как dict.
     text = "\n".join([
-        #f"{ix+1}. {i['name']} — {i['quantity']} x {i['price']}₽"
-        f"{idx+1}. {i.name} — {i.quantity} x {i.price}₽"
-        for ix, i in enumerate(positions)
+        f"{ix+1}. {p['name']} — {p['quantity']} x {p['price']}₽"
+        for ix, p in enumerate(positions)
     ])
     kb = positions_keyboard(positions)
     await call.message.edit_text(f"<b>Все позиции:</b>\n{text}", parse_mode="HTML", reply_markup=kb)

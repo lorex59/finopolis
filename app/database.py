@@ -323,6 +323,18 @@ def save_selected_positions(group_id: str, user_id: int, positions: list[dict]) 
     for lst in SELECTED_POSITIONS.get(str(group_id), {}).values():
         aggregated.extend(lst)
     GROUP_SELECTIONS[str(group_id)] = aggregated
+    # После обновления in-memory структур дополнительно сохраняем детальное
+    # распределение и агрегированное представление в файлы. Это позволит
+    # мини‑приложению и боту восстанавливать выбор при перезапуске или
+    # одновременной работе в разных процессах. Функции ``_persist_detailed_positions``
+    # и ``_persist_selected_positions`` обновляют соответствующие JSON-файлы.
+    try:
+        _persist_detailed_positions()
+        _persist_selected_positions()
+    except Exception as e:
+        # Не прерываем основную логику из‑за ошибок сохранения на диск,
+        # но выводим сообщение для диагностики в консоль.
+        print(f"Ошибка при сохранении выбранных позиций: {e}")
 
 def get_selected_positions(group_id: str) -> dict[int, list[dict]]:
     """
