@@ -48,8 +48,14 @@ import sqlite3
 # ---------------------------------------------------------------------------
 # Настройка SQLite
 # ---------------------------------------------------------------------------
-# Путь к файлу базы данных. Делаем его относительным к текущей директории.
-DB_PATH: str = os.path.join(os.path.dirname(__file__), "database.db")
+# Путь к файлу базы данных. Для обеспечения консистентности между ботом
+# (который импортирует базу из корня проекта) и мини‑приложением (которое
+# находится в подпапке `app`) размещаем файл базы данных на уровень выше
+# директории `app`. Таким образом оба модуля работают с одним и тем же файлом
+# database.db в корне проекта. При желании путь можно переопределить через
+# переменную окружения DATABASE_PATH.
+_base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+DB_PATH: str = os.environ.get('DATABASE_PATH') or os.path.join(_base_dir, 'database.db')
 
 def get_db_connection() -> sqlite3.Connection:
     """Создаёт и возвращает новое соединение с базой данных.
@@ -154,12 +160,14 @@ SELECTED_POSITIONS: dict[str, dict[int, list[dict]]] = defaultdict(lambda: defau
 GROUP_SELECTIONS: dict[str, list[dict]] = defaultdict(list)
 
 # Файл для хранения агрегированных выбранных позиций (без привязки к пользователям).
-# Формат: {"group_id": [ {name, quantity, price}, ... ], ...}
-SELECTED_POSITIONS_FILE: str = os.path.join(os.path.dirname(__file__), 'selected_position.json')
+# Помещаем его на два уровня выше директории `app`, чтобы он лежал рядом с файлом
+# database.py в корне проекта (см. database.py). Это обеспечивает единое хранилище
+# для бота и мини‑приложения.
+_selected_base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+SELECTED_POSITIONS_FILE: str = os.path.join(_selected_base_dir, 'selected_position.json')
 
 # Файл для хранения детального распределения выбранных позиций по пользователям.
-# Формат: {"group_id": {"user_id": [ {name, quantity, price}, ... ], ...}, ...}
-DETAILED_SELECTED_POSITIONS_FILE: str = os.path.join(os.path.dirname(__file__), 'selected_positions.json')
+DETAILED_SELECTED_POSITIONS_FILE: str = os.path.join(_selected_base_dir, 'selected_positions.json')
 
 def _persist_selected_positions() -> None:
     """

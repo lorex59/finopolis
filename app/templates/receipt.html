@@ -5,53 +5,159 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Разделение чека</title>
     <style>
-      body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; padding: 20px; margin: 0; background-color: #f9f9fb; color: #202020; }
-      h1 { font-size: 22px; margin-bottom: 16px; text-align: center; font-weight: 600; }
-      #list { display: flex; flex-direction: column; gap: 8px; }
-      .item { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; background-color: #fff; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,.05); transition: background-color .2s ease, box-shadow .2s ease; cursor: pointer; }
-      .item:hover { box-shadow: 0 2px 4px rgba(0,0,0,.1); }
-      .item.selected { background-color: #e6f4ff; }
-      .item span { font-size: 16px; }
-      .controls { display: flex; align-items: center; gap: 4px; }
-      .controls input[type=number] { width: 50px; padding: 4px; font-size: 14px; }
-      .controls button { width: 28px; height: 28px; font-size: 16px; line-height: 1; padding: 0; border: 1px solid #ccc; background-color: #f0f0f0; cursor: pointer; border-radius: 4px; }
-      .controls button:hover { background-color: #e0e0e0; }
-      button { margin-top: 20px; width: 100%; padding: 12px 0; font-size: 16px; font-weight: 500; background-color: #2ea44f; color: #fff; border: none; border-radius: 8px; cursor: pointer; transition: background-color .2s ease; }
-      button:hover { background-color: #24963f; }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+        padding: 20px;
+        margin: 0;
+        background-color: #f9f9fb;
+        color: #202020;
+      }
+      h1 {
+        font-size: 22px;
+        margin-bottom: 16px;
+        text-align: center;
+        font-weight: 600;
+      }
+      /* Контейнер для списка позиций */
+      #list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 12px 14px;
+        background-color: #ffffff;
+        border-radius: 8px;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+        transition: background-color 0.2s ease, box-shadow 0.2s ease;
+        cursor: pointer;
+      }
+      .item:hover {
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+      }
+      .item.selected {
+        background-color: #e6f4ff;
+      }
+      .item span {
+        font-size: 16px;
+      }
+      .controls {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+      .controls input[type=number] {
+        width: 50px;
+        padding: 4px;
+        font-size: 14px;
+      }
+      .controls button {
+        width: 28px;
+        height: 28px;
+        font-size: 16px;
+        line-height: 1;
+        padding: 0;
+        border: 1px solid #ccc;
+        background-color: #f0f0f0;
+        cursor: pointer;
+        border-radius: 4px;
+      }
+      .controls button:hover {
+        background-color: #e0e0e0;
+      }
+      button {
+        margin-top: 20px;
+        width: 100%;
+        padding: 12px 0;
+        font-size: 16px;
+        font-weight: 500;
+        background-color: #2ea44f;
+        color: #fff;
+        border: none;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: background-color 0.2s ease;
+      }
+      button:hover {
+        background-color: #24963f;
+      }
     </style>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
   </head>
   <body>
     <h1>Выберите позиции, которые вы покупали</h1>
     <div id="list"></div>
+    <!-- Блок с итоговой информацией о выборе -->
     <div id="summary" style="margin-top: 12px; font-weight: bold; text-align: center;"></div>
     <button id="submit">Отправить</button>
     <script>
+      /*
+       * Мини‑приложение для выбора позиций.
+       *
+       * В приватных чатах список позиций передаётся сервером через глобальную
+       * переменную window.POSITIONS. В групповых чатах мини‑приложение
+       * запускается через deep‑link с параметром startapp=group_<id>.
+       * На клиенте мы извлекаем group ID из Telegram.WebApp.initDataUnsafe.start_param
+       * и запрашиваем список позиций через API /webapp/api/positions.
+       */
+
+      // Получаем доступ к WebApp API.
       const tg = Telegram.WebApp;
 
+      /**
+       * Извлекает идентификатор группы из параметра start_param.
+       * Возвращает строку groupId или null, если параметр отсутствует.
+       */
       function extractGroupId() {
         try {
           const initData = tg.initDataUnsafe || {};
-          const p = initData.start_param || initData.tgWebAppStartParam || null;
+          let p = initData.start_param;
           if (!p) return null;
-          return (typeof p === 'string' && p.startsWith('group_')) ? p.substring('group_'.length) : p;
-        } catch (e) { return null; }
+          // Сравниваем префикс group_
+          if (typeof p === 'string' && p.startsWith('group_')) {
+            return p.substring('group_'.length);
+          }
+          return p;
+        } catch (e) {
+          console.warn('Cannot parse start_param', e);
+          return null;
+        }
       }
 
+      /**
+       * Загружает список позиций. Если глобальная переменная POSITIONS
+       * уже содержит массив позиций (для приватных чатов), возвращает его.
+       * В противном случае извлекает groupId и запрашивает данные с сервера.
+       */
       async function getPositions() {
-        if (Array.isArray(window.POSITIONS) && window.POSITIONS.length > 0) return window.POSITIONS;
+        if (Array.isArray(window.POSITIONS) && window.POSITIONS.length > 0) {
+          return window.POSITIONS;
+        }
         const groupId = extractGroupId();
-        if (!groupId) return [];
+        if (!groupId) {
+          return [];
+        }
         try {
-          const r = await fetch(`/webapp/api/positions?group_id=${encodeURIComponent(groupId)}`);
-          if (!r.ok) return [];
-          const data = await r.json();
-          return Array.isArray(data) ? data : [];
-        } catch (e) { return []; }
+          const response = await fetch(`/webapp/api/positions?group_id=${encodeURIComponent(groupId)}`);
+          if (!response.ok) {
+            return [];
+          }
+          const data = await response.json();
+          if (Array.isArray(data)) return data;
+          return [];
+        } catch (err) {
+          console.error('Error fetching positions', err);
+          return [];
+        }
       }
 
+      // Функция для пересчёта суммы и количества выбранных позиций.
       function updateSummary(selectedQuantities, positions, summaryEl) {
-        let total = 0, count = 0;
+        let total = 0;
+        let count = 0;
         Object.keys(selectedQuantities).forEach((idx) => {
           const qtySelected = parseFloat(selectedQuantities[idx]) || 0;
           if (qtySelected > 0) {
@@ -61,19 +167,22 @@
             count += qtySelected;
           }
         });
-        summaryEl.textContent = count === 0 ? 'Ничего не выбрано' : `Выбрано ${count} ${count === 1 ? 'позиция' : (count < 5 ? 'позиции' : 'позиций')} на сумму ${total.toFixed(2)}₽`;
+        summaryEl.textContent = count === 0
+          ? 'Ничего не выбрано'
+          : `Выбрано ${count} ${count === 1 ? 'позиция' : (count < 5 ? 'позиции' : 'позиций')} на сумму ${total.toFixed(2)}₽`;
       }
 
+      // Асинхронная инициализация.
       (async function init() {
         const positions = await getPositions();
         const listEl = document.getElementById('list');
         const summaryEl = document.getElementById('summary');
         const selectedQuantities = {};
-
+        // Заполняем список позиций
         positions.forEach((item, idx) => {
           const el = document.createElement('div');
           el.className = 'item';
-
+          // Левая часть: название, количество и цена
           const infoContainer = document.createElement('div');
           infoContainer.style.display = 'flex';
           infoContainer.style.flexDirection = 'column';
@@ -87,70 +196,134 @@
           infoContainer.appendChild(nameSpan);
           infoContainer.appendChild(qtyPriceSpan);
           el.appendChild(infoContainer);
-
+          // Правая часть: кнопки +/‑ и поле ввода
           const controls = document.createElement('div');
           controls.className = 'controls';
           const maxQty = parseFloat(item.quantity) || 1;
-          const minusBtn = document.createElement('button'); minusBtn.type = 'button'; minusBtn.textContent = '–';
-          const input = document.createElement('input'); input.type = 'number'; input.min = '0'; input.max = String(maxQty); input.step = '1'; input.value = '0';
-          const plusBtn = document.createElement('button'); plusBtn.type = 'button'; plusBtn.textContent = '+';
-
+          const minusBtn = document.createElement('button');
+          minusBtn.type = 'button';
+          minusBtn.textContent = '–';
+          const input = document.createElement('input');
+          input.type = 'number';
+          input.min = '0';
+          input.max = String(maxQty);
+          input.step = '1';
+          input.value = '0';
+          const plusBtn = document.createElement('button');
+          plusBtn.type = 'button';
+          plusBtn.textContent = '+';
           function updateSelection(val) {
-            if (val > 0) { selectedQuantities[idx] = val; el.classList.add('selected'); }
-            else { delete selectedQuantities[idx]; el.classList.remove('selected'); }
+            if (val > 0) {
+              selectedQuantities[idx] = val;
+              el.classList.add('selected');
+            } else {
+              delete selectedQuantities[idx];
+              el.classList.remove('selected');
+            }
           }
-          minusBtn.addEventListener('click', (ev) => { ev.stopPropagation(); let v = parseInt(input.value)||0; if (v>0){ v--; input.value=String(v); updateSelection(v); updateSummary(selectedQuantities, positions, summaryEl);} });
-          plusBtn.addEventListener('click', (ev) => { ev.stopPropagation(); let v = parseInt(input.value)||0; if (v<maxQty){ v++; input.value=String(v); updateSelection(v); updateSummary(selectedQuantities, positions, summaryEl);} });
-          input.addEventListener('input', () => { let v = parseInt(input.value)||0; if (v<0) v=0; if (v>maxQty) v=maxQty; input.value=String(v); updateSelection(v); updateSummary(selectedQuantities, positions, summaryEl); });
-          el.addEventListener('click', (ev) => {
-            if (ev.target === minusBtn || ev.target === plusBtn || ev.target === input) return;
-            let v = parseInt(input.value)||0; if (v<maxQty){ v++; input.value=String(v); updateSelection(v); updateSummary(selectedQuantities, positions, summaryEl); }
+          minusBtn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            let val = parseInt(input.value) || 0;
+            if (val > 0) {
+              val--;
+              input.value = String(val);
+              updateSelection(val);
+              updateSummary(selectedQuantities, positions, summaryEl);
+            }
           });
-
-          controls.appendChild(minusBtn); controls.appendChild(input); controls.appendChild(plusBtn);
+          plusBtn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            let val = parseInt(input.value) || 0;
+            if (val < maxQty) {
+              val++;
+              input.value = String(val);
+              updateSelection(val);
+              updateSummary(selectedQuantities, positions, summaryEl);
+            }
+          });
+          input.addEventListener('input', () => {
+            let val = parseInt(input.value) || 0;
+            if (val < 0) val = 0;
+            if (val > maxQty) val = maxQty;
+            input.value = String(val);
+            updateSelection(val);
+            updateSummary(selectedQuantities, positions, summaryEl);
+          });
+          el.addEventListener('click', (ev) => {
+            if (ev.target === minusBtn || ev.target === plusBtn || ev.target === input) {
+              return;
+            }
+            let val = parseInt(input.value) || 0;
+            if (val < maxQty) {
+              val++;
+              input.value = String(val);
+              updateSelection(val);
+              updateSummary(selectedQuantities, positions, summaryEl);
+            }
+          });
+          controls.appendChild(minusBtn);
+          controls.appendChild(input);
+          controls.appendChild(plusBtn);
           el.appendChild(controls);
           listEl.appendChild(el);
         });
-
+        // Инициализируем отображение
         updateSummary(selectedQuantities, positions, summaryEl);
-
+        // Отправляем данные обратно в бота
         document.getElementById('submit').addEventListener('click', () => {
+          // Формируем объект выбранных позиций: index → quantity
           const payload = {};
           Object.keys(selectedQuantities).forEach((idx) => {
             const qty = parseFloat(selectedQuantities[idx]) || 0;
-            if (qty > 0) payload[idx] = qty;
+            if (qty > 0) {
+              payload[idx] = qty;
+            }
           });
-
           const groupId = extractGroupId();
+          const userId = (tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) || null;
+          // Подготовим данные для отправки
+          // Базовые данные, которые отправим: выбор и group_id
           const data = { selected: payload };
-          if (groupId) data.group_id = groupId;
-
-          const hasStartParam = tg.initDataUnsafe && (tg.initDataUnsafe.start_param || tg.initDataUnsafe.tgWebAppStartParam);
+          if (groupId) {
+            data.group_id = groupId;
+          }
+          /*
+           * Отправляем выбранные позиции. Если mini‑приложение запущено через клавиатурную
+           * кнопку (reply‑keyboard), Telegram позволяет использовать WebApp.sendData(),
+           * и бот получит сообщение с web_app_data. Для deep‑link (startapp=...) такая
+           * возможность отсутствует, поэтому данные нужно отправлять напрямую на
+           * backend-сервер. Проверяем наличие start_param: если он присутствует,
+           * отправляем JSON через fetch; иначе используем sendData.
+           */
+          const hasStartParam = tg.initDataUnsafe && tg.initDataUnsafe.start_param;
           const chatType = tg.initDataUnsafe && tg.initDataUnsafe.chat_type;
+          // Мини‑приложение, запущенное по ссылке (start_param или chat_type group/supergroup)
           const useBackend = hasStartParam || (chatType && chatType !== 'private');
-
           if (useBackend) {
+            // Подписываем запрос с помощью initData для последующей валидации на сервере
             const authString = tg.initData || '';
-            const submitUrl = (typeof BACKEND_URL !== 'undefined' && BACKEND_URL) ? `${BACKEND_URL}/webapp/api/submit` : '/webapp/api/submit';
-            (async () => {
-              try {
-                const resp = await fetch(submitUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, _auth: authString }) });
-                if (!resp.ok) {
-                  const t = await resp.text().catch(() => '');
-                  console.error('Submit failed', resp.status, t);
-                  tg.showAlert('Не удалось сохранить выбор. Попробуйте ещё раз.');
-                  return;
-                }
-                tg.showAlert('Готово! Выбор сохранён.');
-                setTimeout(() => tg.close(), 150); // tiny delay for UX
-              } catch (e) {
-                console.error('Error submitting selection', e);
-                tg.showAlert('Ошибка сети. Проверьте интернет и попробуйте снова.');
-              }
-            })();
+            const payloadBody = { ...data, _auth: authString };
+            // Определяем URL для отправки: используем глобальную переменную BACKEND_URL,
+            // если она определена (вставляется сервером через render_receipt_page). Иначе
+            // падёмся на относительный путь (когда страница загружена с backend'а напрямую).
+            const submitUrl = (typeof BACKEND_URL !== 'undefined' && BACKEND_URL)
+              ? `${BACKEND_URL}/webapp/api/submit`
+              : '/webapp/api/submit';
+            fetch(submitUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payloadBody),
+            })
+              .catch((err) => {
+                console.error('Error submitting selection', err);
+              })
+              .finally(() => {
+                tg.close();
+              });
           } else {
+            // Стандартный механизм через sendData — бот получит web_app_data
             tg.sendData(JSON.stringify(data));
-            setTimeout(() => tg.close(), 150);
+            tg.close();
           }
         });
       })();
