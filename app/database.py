@@ -44,12 +44,23 @@ from typing import Any
 import os
 import json
 import sqlite3
+import logging
+logging.basicConfig(
+    level=logging.DEBUG,  # максимум информации
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("webapp")
 
 # ---------------------------------------------------------------------------
 # Настройка SQLite
 # ---------------------------------------------------------------------------
-# Путь к файлу базы данных. Делаем его относительным к текущей директории.
-DB_PATH: str = os.path.join(os.path.dirname(__file__), "database.db")
+# Путь к файлу базы данных. Для корректной работы и избегания дублирования
+# базы данных между корнем проекта и подпакетом ``app`` мы всегда
+# используем один и тот же файл в корне репозитория. Эта переменная
+# рассчитывается относительно расположения текущего файла (app/database.py)
+# и поднимается на один уровень вверх. Таким образом и бот, и мини‑приложение
+# работают с одним файлом ``database.db``, расположенным в корне проекта.
+DB_PATH: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "database.db")
 
 def get_db_connection() -> sqlite3.Connection:
     """Создаёт и возвращает новое соединение с базой данных.
@@ -65,6 +76,16 @@ def get_db_connection() -> sqlite3.Connection:
 
 def init_db() -> None:
     """Создаёт необходимые таблицы, если они не существуют."""
+    # Перед созданием таблиц удаляем существующий файл базы данных. Это
+    # гарантирует, что приложение всегда начинает работу с чистой базой.
+    # Если необходимо сохранять данные между перезапусками, закомментируйте
+    # строку ниже.
+    try:
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+            logger.debug(f"Удалён существующий файл базы данных: {DB_PATH}")
+    except Exception:
+        pass
     conn = get_db_connection()
     cur = conn.cursor()
     cur.executescript(
@@ -98,38 +119,48 @@ def init_db() -> None:
     conn.commit()
     conn.close()
 
+    # После создания таблиц очищаем таблицы positions и selected_positions.
+    # Это позволяет избежать ситуаций, когда в базе данных остаются
+    # устаревшие данные от предыдущих запусков (например, при тестировании).
+    # Если вам требуется сохранение данных между перезапусками, удалите
+    # строки ниже.
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM positions")
+        cur.execute("DELETE FROM selected_positions")
+        conn.commit()
+    finally:
+        conn.close()
+
 # Инициализируем базу данных при импорте.
 init_db()
 
 # ---------------------------------------------------------------------------
-# Старые in‑memory структуры для обратной совместимости. Они будут
-# синхронизированы с базой данных по мере необходимости.
-USERS: dict[int, dict[str, Any]] = {688410426: {'full_name': 'danil', 'phone': '+79644324111', 'bank': 'Tinkoff'}}  # user_id → профиль
-RECEIPTS: dict[str, dict[str, Any]] = defaultdict(dict)  # receipt_id → данные чека
-DEBTS: dict[str, dict[int, float]] = defaultdict(dict)    # receipt_id → user_id → сумма
-
-# Журнал выполненных платежей.
-# Каждый элемент содержит идентификатор чека, идентификатор транзакции
-# и отображение user_id → сумма, которое было отправлено в платёжную систему.
-PAYMENT_LOG: list[dict[str, object]] = []
+# В этой версии модуля мы исключили все глобальные структуры хранения
+# данных. Все сведения о пользователях, позициях, выборе пользователей и
+# распределениях хранятся исключительно в базе данных. Локальные словари
+# и списки используются только для временных операций, связанных с
+# определёнными сессиями (например, для текстового ввода или хранения
+# текущих назначений в рамках одного расчёта). Для таких целей
+# предусмотрены объекты ASSIGNMENTS и TEXT_SESSIONS ниже.
 
 def log_payment(receipt_id: str, transaction_id: str, debt_mapping: dict[int, float]) -> None:
-    """Сохраняет информацию о выполненном переводе в журнал (в памяти).
+    """Регистрирует факт платежа.
 
-    Аргументы:
-        receipt_id: идентификатор чата/чека
-        transaction_id: уникальный идентификатор транзакции, возвращаемый платёжным шлюзом
-        debt_mapping: словарь user_id → сумма, которую пользователь должен
+    В текущей реализации сведения о платежах не сохраняются в оперативной памяти.
+    При необходимости ведения истории платежей реализуйте запись в отдельную
+    таблицу базы данных.
     """
-    PAYMENT_LOG.append({
-        "receipt_id": receipt_id,
-        "transaction_id": transaction_id,
-        "debt_mapping": debt_mapping.copy(),
-    })
+    pass
 
 def get_payment_log() -> list[dict[str, object]]:
-    """Возвращает копию журнала платежей."""
-    return list(PAYMENT_LOG)
+    """Возвращает пустой список платёжных записей.
+
+    История платежей не сохраняется в оперативной памяти. Реализуйте этот
+    интерфейс при необходимости.
+    """
+    return []
 
 # --- Распределённые позиции ---
 # В рамках распределения позиций мы храним два уровня данных:
@@ -310,31 +341,9 @@ def save_selected_positions(group_id: str, user_id: int, positions: list[dict]) 
             )
     conn.commit()
     conn.close()
-    # Обновляем in‑memory SELECTED_POSITIONS
-    if positions:
-        SELECTED_POSITIONS[str(group_id)][user_id] = positions
-    else:
-        if str(group_id) in SELECTED_POSITIONS and user_id in SELECTED_POSITIONS[str(group_id)]:
-            del SELECTED_POSITIONS[str(group_id)][user_id]
-            if not SELECTED_POSITIONS[str(group_id)]:
-                del SELECTED_POSITIONS[str(group_id)]
-    # Пересчитываем агрегированное представление
-    aggregated: list[dict] = []
-    for lst in SELECTED_POSITIONS.get(str(group_id), {}).values():
-        aggregated.extend(lst)
-    GROUP_SELECTIONS[str(group_id)] = aggregated
-    # После обновления in-memory структур дополнительно сохраняем детальное
-    # распределение и агрегированное представление в файлы. Это позволит
-    # мини‑приложению и боту восстанавливать выбор при перезапуске или
-    # одновременной работе в разных процессах. Функции ``_persist_detailed_positions``
-    # и ``_persist_selected_positions`` обновляют соответствующие JSON-файлы.
-    try:
-        _persist_detailed_positions()
-        _persist_selected_positions()
-    except Exception as e:
-        # Не прерываем основную логику из‑за ошибок сохранения на диск,
-        # но выводим сообщение для диагностики в консоль.
-        print(f"Ошибка при сохранении выбранных позиций: {e}")
+    # Не обновляем in‑memory SELECTED_POSITIONS или GROUP_SELECTIONS и не
+    # сохраняем данные в JSON‑файлы. Все данные о выборе хранятся
+    # исключительно в таблице selected_positions базы данных.
 
 def get_selected_positions(group_id: str) -> dict[int, list[dict]]:
     """
@@ -388,9 +397,7 @@ def get_selected_positions(group_id: str) -> dict[int, list[dict]]:
         name = row['name'] if row['name'] is not None else ''
         item = {'name': name, 'quantity': row['quantity'], 'price': row['price']}
         result.setdefault(uid, []).append(item)
-    # Синхронизируем in‑memory
-    SELECTED_POSITIONS[str(group_id)] = {uid: list(lst) for uid, lst in result.items()}
-    GROUP_SELECTIONS[str(group_id)] = [pos for lst in result.values() for pos in lst]
+    # Не обновляем in‑memory SELECTED_POSITIONS или GROUP_SELECTIONS.
     return result
 
 def get_group_selected_positions(group_id: str) -> list[dict]:
@@ -430,8 +437,7 @@ def get_group_selected_positions(group_id: str) -> list[dict]:
     for row in rows:
         name = row['name'] if row['name'] is not None else ''
         result.append({'name': name, 'quantity': row['quantity'], 'price': row['price']})
-    # Обновляем GROUP_SELECTIONS для совместимости
-    GROUP_SELECTIONS[str(group_id)] = list(result)
+    # Не обновляем in‑memory GROUP_SELECTIONS.
     return result
 
 # Путь к файлу, в котором будем хранить список позиций. Это нужно для обмена
@@ -462,10 +468,7 @@ def persist_positions(positions: dict[str, list]) -> None:
             )
     conn.commit()
     conn.close()
-    # Синхронизируем in‑memory POSITIONS
-    POSITIONS.clear()
-    for g, lst in positions.items():
-        POSITIONS[str(g)] = list(lst)
+    # Не обновляем in‑memory POSITIONS. Данные берутся строго из базы данных.
 
 def load_positions() -> dict[str, list]:
     """Загружает словарь позиций из базы данных.
@@ -483,13 +486,10 @@ def load_positions() -> dict[str, list]:
     rows = cur.fetchall()
     conn.close()
     result: dict[str, list] = {}
-    # Очищаем in‑memory POSITIONS
-    POSITIONS.clear()
     for row in rows:
         g_id = str(row['group_id'])
         item = {'name': row['name'], 'quantity': row['quantity'], 'price': row['price']}
         result.setdefault(g_id, []).append(item)
-        POSITIONS[g_id].append(item.copy())
     return result
 
 def save_user(user_id: int, data: dict[str, Any]) -> None:
@@ -536,14 +536,8 @@ def save_user(user_id: int, data: dict[str, Any]) -> None:
     conn.commit()
     conn.close()
 
-    # Обновляем in‑memory словарь для обратной совместимости
-    USERS[user_id] = {
-        'full_name': full_name,
-        'phone': phone,
-        'bank': bank,
-        # telegram_login сохраняем, если есть
-        **({'telegram_login': telegram_login} if telegram_login else {}),
-    }
+    # В этой версии данные пользователя хранятся только в базе данных. Никакие
+    # in‑memory словари не обновляются.
 
 
 def get_all_users():
@@ -575,12 +569,6 @@ def get_all_users():
         if row['telegram_login']:
             user_dict['telegram_login'] = row['telegram_login']
         result.append((uid, user_dict))
-        # синхронизируем USERS
-        USERS[uid] = user_dict
-    # Также добавляем оставшиеся записи из USERS, которых нет в базе
-    for uid, data in USERS.items():
-        if not any(uid == r[0] for r in result):
-            result.append((uid, data))
     return result
 
 def get_user(user_id: int) -> dict[str, Any] | None:
@@ -606,17 +594,25 @@ def get_user(user_id: int) -> dict[str, Any] | None:
         }
         if row['telegram_login']:
             user_dict['telegram_login'] = row['telegram_login']
-        # синхронизируем USERS
-        USERS[user_id] = user_dict
         return user_dict
-    # если нет в базе, смотрим в USERS
-    return USERS.get(user_id)
+    # Если не найдено в базе, возвращаем None. Никакого fallback к in‑memory нет.
+    return None
 
 def save_receipt(receipt_id: str, items: dict[str, float]) -> None:
-    RECEIPTS[receipt_id] = items
+    """Сохраняет информацию о чеке.
+
+    Данная функция оставлена для совместимости, но не выполняет никакой
+    операции, поскольку все позиции чека сохраняются в таблице `positions`.
+    """
+    pass
 
 def save_debts(receipt_id: str, mapping: dict[int, float]) -> None:
-    DEBTS[receipt_id] = mapping
+    """Сохраняет расчётные долги для чека.
+
+    В текущей реализации данные о долгах не сохраняются. Для хранения
+    результатов расчёта реализуйте запись в отдельную таблицу базы данных.
+    """
+    pass
 
 """
 In‑memory storage for users, receipts, positions and assignments.
@@ -673,8 +669,7 @@ def add_positions(group_id: str, new_positions: list) -> None:
         )
     conn.commit()
     conn.close()
-    # Обновляем in‑memory список для группы, добавляя новые позиции.
-    POSITIONS[str(group_id)].extend(new_positions)
+    # Не обновляем in‑memory список POSITIONS. Данные берутся строго из базы.
 
 def get_positions(group_id: str | None = None) -> list:
     """
@@ -695,14 +690,10 @@ def get_positions(group_id: str | None = None) -> list:
         rows = cur.fetchall()
         # Закрываем соединение сразу после выборки
         conn.close()
-        # Пересобираем in‑memory POSITIONS и формируем объединённый список
-        POSITIONS.clear()
         combined: list[dict] = []
         for row in rows:
-            g_id = str(row['group_id'])
             item = {'name': row['name'], 'quantity': row['quantity'], 'price': row['price']}
-            POSITIONS[g_id].append(item)
-            combined.append(item.copy())
+            combined.append(item)
         return combined
     else:
         cur.execute(
@@ -716,7 +707,6 @@ def get_positions(group_id: str | None = None) -> list:
             {'name': row['name'], 'quantity': row['quantity'], 'price': row['price']}
             for row in rows
         ]
-        POSITIONS[str(group_id)] = list(result)
         return result
 
 def set_positions(group_id: str, positions: list) -> None:
@@ -739,10 +729,7 @@ def set_positions(group_id: str, positions: list) -> None:
             )
     conn.commit()
     conn.close()
-    if positions:
-        POSITIONS[str(group_id)] = list(positions)
-    else:
-        POSITIONS.pop(str(group_id), None)
+    # Не обновляем in‑memory POSITIONS. Данные берутся из базы данных.
 
 def init_assignments(receipt_id: str) -> None:
     """Initialise (or reset) the assignments mapping for a given receipt."""

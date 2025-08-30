@@ -8,9 +8,9 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
 from config import settings
-from database import save_user
+from app.database import save_user
 
-from database import get_all_users, get_user
+from app.database import get_all_users, get_user
 
 
 router = Router(name="auth")
