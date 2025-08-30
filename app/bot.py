@@ -34,6 +34,7 @@ async def main() -> None:
     # Подмешиваем middleware только к группам, где id < 0
     dp.message.middleware(AuthRequiredMiddleware())
     print("Bot started.")
+    print("Backend URL:", settings.backend_url)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
