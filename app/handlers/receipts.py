@@ -5,20 +5,11 @@ from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, WebAppInfo
 
 from services.llm_api import extract_items_from_image
-from database import (
-    add_positions,
-    get_positions,
-    set_positions,
-    init_assignments,
-    set_assignment,
-    get_assignments,
-    start_text_session,
-    append_text_message,
-    end_text_session,
-    get_all_users,
-    save_debts,
-    save_selected_positions,
-    get_selected_positions,
+from app.database import (
+    add_positions, get_positions, set_positions, init_assignments, set_assignment,
+    get_assignments, start_text_session, append_text_message, end_text_session,
+    get_all_users, save_debts, save_selected_positions, get_selected_positions,
+    get_user, log_payment
 )
 from keyboards import positions_keyboard
 from aiogram.fsm.context import FSMContext
