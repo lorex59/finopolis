@@ -70,6 +70,16 @@ def get_db_connection() -> sqlite3.Connection:
 
 def init_db() -> None:
     """Создаёт необходимые таблицы, если они не существуют."""
+    # Перед созданием таблиц удаляем существующий файл базы данных. Это
+    # гарантирует, что приложение всегда начинает работу с чистой базой.
+    # Если необходимо сохранять данные между перезапусками, закомментируйте
+    # строку ниже.
+    try:
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+            print(f"Существующий файл базы данных '{DB_PATH}' удалён.")
+    except Exception:
+        pass
     conn = get_db_connection()
     cur = conn.cursor()
     cur.executescript(
