@@ -51,7 +51,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("webapp")
 
-
 # ---------------------------------------------------------------------------
 # Настройка SQLite
 # ---------------------------------------------------------------------------
@@ -138,34 +137,30 @@ def init_db() -> None:
 init_db()
 
 # ---------------------------------------------------------------------------
-# Старые in‑memory структуры для обратной совместимости. Они будут
-# синхронизированы с базой данных по мере необходимости.
-USERS: dict[int, dict[str, Any]] = {688410426: {'full_name': 'danil', 'phone': '+79644324111', 'bank': 'Tinkoff'}}  # user_id → профиль
-RECEIPTS: dict[str, dict[str, Any]] = defaultdict(dict)  # receipt_id → данные чека
-DEBTS: dict[str, dict[int, float]] = defaultdict(dict)    # receipt_id → user_id → сумма
-
-# Журнал выполненных платежей.
-# Каждый элемент содержит идентификатор чека, идентификатор транзакции
-# и отображение user_id → сумма, которое было отправлено в платёжную систему.
-PAYMENT_LOG: list[dict[str, object]] = []
+# В этой версии модуля мы исключили все глобальные структуры хранения
+# данных. Все сведения о пользователях, позициях, выборе пользователей и
+# распределениях хранятся исключительно в базе данных. Локальные словари
+# и списки используются только для временных операций, связанных с
+# определёнными сессиями (например, для текстового ввода или хранения
+# текущих назначений в рамках одного расчёта). Для таких целей
+# предусмотрены объекты ASSIGNMENTS и TEXT_SESSIONS ниже.
 
 def log_payment(receipt_id: str, transaction_id: str, debt_mapping: dict[int, float]) -> None:
-    """Сохраняет информацию о выполненном переводе в журнал (в памяти).
+    """Регистрирует факт платежа.
 
-    Аргументы:
-        receipt_id: идентификатор чата/чека
-        transaction_id: уникальный идентификатор транзакции, возвращаемый платёжным шлюзом
-        debt_mapping: словарь user_id → сумма, которую пользователь должен
+    В текущей реализации сведения о платежах не сохраняются в оперативной памяти.
+    При необходимости ведения истории платежей реализуйте запись в отдельную
+    таблицу базы данных.
     """
-    PAYMENT_LOG.append({
-        "receipt_id": receipt_id,
-        "transaction_id": transaction_id,
-        "debt_mapping": debt_mapping.copy(),
-    })
+    pass
 
 def get_payment_log() -> list[dict[str, object]]:
-    """Возвращает копию журнала платежей."""
-    return list(PAYMENT_LOG)
+    """Возвращает пустой список платёжных записей.
+
+    История платежей не сохраняется в оперативной памяти. Реализуйте этот
+    интерфейс при необходимости.
+    """
+    return []
 
 # --- Распределённые позиции ---
 # В рамках распределения позиций мы храним два уровня данных:
@@ -541,14 +536,8 @@ def save_user(user_id: int, data: dict[str, Any]) -> None:
     conn.commit()
     conn.close()
 
-    # Обновляем in‑memory словарь для обратной совместимости
-    USERS[user_id] = {
-        'full_name': full_name,
-        'phone': phone,
-        'bank': bank,
-        # telegram_login сохраняем, если есть
-        **({'telegram_login': telegram_login} if telegram_login else {}),
-    }
+    # В этой версии данные пользователя хранятся только в базе данных. Никакие
+    # in‑memory словари не обновляются.
 
 
 def get_all_users():
@@ -580,12 +569,6 @@ def get_all_users():
         if row['telegram_login']:
             user_dict['telegram_login'] = row['telegram_login']
         result.append((uid, user_dict))
-        # синхронизируем USERS
-        USERS[uid] = user_dict
-    # Также добавляем оставшиеся записи из USERS, которых нет в базе
-    for uid, data in USERS.items():
-        if not any(uid == r[0] for r in result):
-            result.append((uid, data))
     return result
 
 def get_user(user_id: int) -> dict[str, Any] | None:
@@ -611,17 +594,25 @@ def get_user(user_id: int) -> dict[str, Any] | None:
         }
         if row['telegram_login']:
             user_dict['telegram_login'] = row['telegram_login']
-        # синхронизируем USERS
-        USERS[user_id] = user_dict
         return user_dict
-    # если нет в базе, смотрим в USERS
-    return USERS.get(user_id)
+    # Если не найдено в базе, возвращаем None. Никакого fallback к in‑memory нет.
+    return None
 
 def save_receipt(receipt_id: str, items: dict[str, float]) -> None:
-    RECEIPTS[receipt_id] = items
+    """Сохраняет информацию о чеке.
+
+    Данная функция оставлена для совместимости, но не выполняет никакой
+    операции, поскольку все позиции чека сохраняются в таблице `positions`.
+    """
+    pass
 
 def save_debts(receipt_id: str, mapping: dict[int, float]) -> None:
-    DEBTS[receipt_id] = mapping
+    """Сохраняет расчётные долги для чека.
+
+    В текущей реализации данные о долгах не сохраняются. Для хранения
+    результатов расчёта реализуйте запись в отдельную таблицу базы данных.
+    """
+    pass
 
 """
 In‑memory storage for users, receipts, positions and assignments.
