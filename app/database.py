@@ -103,6 +103,20 @@ def init_db() -> None:
     conn.commit()
     conn.close()
 
+    # После создания таблиц очищаем таблицы positions и selected_positions.
+    # Это позволяет избежать ситуаций, когда в базе данных остаются
+    # устаревшие данные от предыдущих запусков (например, при тестировании).
+    # Если вам требуется сохранение данных между перезапусками, удалите
+    # строки ниже.
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM positions")
+        cur.execute("DELETE FROM selected_positions")
+        conn.commit()
+    finally:
+        conn.close()
+
 # Инициализируем базу данных при импорте.
 init_db()
 
@@ -315,31 +329,9 @@ def save_selected_positions(group_id: str, user_id: int, positions: list[dict]) 
             )
     conn.commit()
     conn.close()
-    # Обновляем in‑memory SELECTED_POSITIONS
-    if positions:
-        SELECTED_POSITIONS[str(group_id)][user_id] = positions
-    else:
-        if str(group_id) in SELECTED_POSITIONS and user_id in SELECTED_POSITIONS[str(group_id)]:
-            del SELECTED_POSITIONS[str(group_id)][user_id]
-            if not SELECTED_POSITIONS[str(group_id)]:
-                del SELECTED_POSITIONS[str(group_id)]
-    # Пересчитываем агрегированное представление
-    aggregated: list[dict] = []
-    for lst in SELECTED_POSITIONS.get(str(group_id), {}).values():
-        aggregated.extend(lst)
-    GROUP_SELECTIONS[str(group_id)] = aggregated
-    # После обновления in-memory структур дополнительно сохраняем детальное
-    # распределение и агрегированное представление в файлы. Это позволит
-    # мини‑приложению и боту восстанавливать выбор при перезапуске или
-    # одновременной работе в разных процессах. Функции ``_persist_detailed_positions``
-    # и ``_persist_selected_positions`` обновляют соответствующие JSON-файлы.
-    try:
-        _persist_detailed_positions()
-        _persist_selected_positions()
-    except Exception as e:
-        # Не прерываем основную логику из‑за ошибок сохранения на диск,
-        # но выводим сообщение для диагностики в консоль.
-        print(f"Ошибка при сохранении выбранных позиций: {e}")
+    # Не обновляем in‑memory SELECTED_POSITIONS или GROUP_SELECTIONS и не
+    # сохраняем данные в JSON‑файлы. Все данные о выборе хранятся
+    # исключительно в таблице selected_positions базы данных.
 
 def get_selected_positions(group_id: str) -> dict[int, list[dict]]:
     """
@@ -393,9 +385,7 @@ def get_selected_positions(group_id: str) -> dict[int, list[dict]]:
         name = row['name'] if row['name'] is not None else ''
         item = {'name': name, 'quantity': row['quantity'], 'price': row['price']}
         result.setdefault(uid, []).append(item)
-    # Синхронизируем in‑memory
-    SELECTED_POSITIONS[str(group_id)] = {uid: list(lst) for uid, lst in result.items()}
-    GROUP_SELECTIONS[str(group_id)] = [pos for lst in result.values() for pos in lst]
+    # Не обновляем in‑memory SELECTED_POSITIONS или GROUP_SELECTIONS.
     return result
 
 def get_group_selected_positions(group_id: str) -> list[dict]:
@@ -435,8 +425,7 @@ def get_group_selected_positions(group_id: str) -> list[dict]:
     for row in rows:
         name = row['name'] if row['name'] is not None else ''
         result.append({'name': name, 'quantity': row['quantity'], 'price': row['price']})
-    # Обновляем GROUP_SELECTIONS для совместимости
-    GROUP_SELECTIONS[str(group_id)] = list(result)
+    # Не обновляем in‑memory GROUP_SELECTIONS.
     return result
 
 # Путь к файлу, в котором будем хранить список позиций. Это нужно для обмена
@@ -467,10 +456,7 @@ def persist_positions(positions: dict[str, list]) -> None:
             )
     conn.commit()
     conn.close()
-    # Синхронизируем in‑memory POSITIONS
-    POSITIONS.clear()
-    for g, lst in positions.items():
-        POSITIONS[str(g)] = list(lst)
+    # Не обновляем in‑memory POSITIONS. Данные берутся строго из базы данных.
 
 def load_positions() -> dict[str, list]:
     """Загружает словарь позиций из базы данных.
@@ -488,13 +474,10 @@ def load_positions() -> dict[str, list]:
     rows = cur.fetchall()
     conn.close()
     result: dict[str, list] = {}
-    # Очищаем in‑memory POSITIONS
-    POSITIONS.clear()
     for row in rows:
         g_id = str(row['group_id'])
         item = {'name': row['name'], 'quantity': row['quantity'], 'price': row['price']}
         result.setdefault(g_id, []).append(item)
-        POSITIONS[g_id].append(item.copy())
     return result
 
 def save_user(user_id: int, data: dict[str, Any]) -> None:
@@ -678,8 +661,7 @@ def add_positions(group_id: str, new_positions: list) -> None:
         )
     conn.commit()
     conn.close()
-    # Обновляем in‑memory список для группы, добавляя новые позиции.
-    POSITIONS[str(group_id)].extend(new_positions)
+    # Не обновляем in‑memory список POSITIONS. Данные берутся строго из базы.
 
 def get_positions(group_id: str | None = None) -> list:
     """
@@ -700,14 +682,10 @@ def get_positions(group_id: str | None = None) -> list:
         rows = cur.fetchall()
         # Закрываем соединение сразу после выборки
         conn.close()
-        # Пересобираем in‑memory POSITIONS и формируем объединённый список
-        POSITIONS.clear()
         combined: list[dict] = []
         for row in rows:
-            g_id = str(row['group_id'])
             item = {'name': row['name'], 'quantity': row['quantity'], 'price': row['price']}
-            POSITIONS[g_id].append(item)
-            combined.append(item.copy())
+            combined.append(item)
         return combined
     else:
         cur.execute(
@@ -721,7 +699,6 @@ def get_positions(group_id: str | None = None) -> list:
             {'name': row['name'], 'quantity': row['quantity'], 'price': row['price']}
             for row in rows
         ]
-        POSITIONS[str(group_id)] = list(result)
         return result
 
 def set_positions(group_id: str, positions: list) -> None:
@@ -744,10 +721,7 @@ def set_positions(group_id: str, positions: list) -> None:
             )
     conn.commit()
     conn.close()
-    if positions:
-        POSITIONS[str(group_id)] = list(positions)
-    else:
-        POSITIONS.pop(str(group_id), None)
+    # Не обновляем in‑memory POSITIONS. Данные берутся из базы данных.
 
 def init_assignments(receipt_id: str) -> None:
     """Initialise (or reset) the assignments mapping for a given receipt."""
