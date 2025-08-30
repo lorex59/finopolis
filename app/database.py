@@ -44,6 +44,13 @@ from typing import Any
 import os
 import json
 import sqlite3
+import logging
+logging.basicConfig(
+    level=logging.DEBUG,  # максимум информации
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("webapp")
+
 
 # ---------------------------------------------------------------------------
 # Настройка SQLite
@@ -77,7 +84,7 @@ def init_db() -> None:
     try:
         if os.path.exists(DB_PATH):
             os.remove(DB_PATH)
-            print(f"Существующий файл базы данных '{DB_PATH}' удалён.")
+            logger.debug(f"Удалён существующий файл базы данных: {DB_PATH}")
     except Exception:
         pass
     conn = get_db_connection()
