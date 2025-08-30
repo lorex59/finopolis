@@ -176,13 +176,13 @@ async def submit_selection(request: Request):
     user = None
     # Попытка 1: как есть
     try:
-        parsed = safe_parse_webapp_init_data(init_data, bot_token=settings.bot_token)
+        parsed = safe_parse_webapp_init_data(init_data=init_data, bot_token=settings.bot_token)
         user = parsed.user
     except Exception:
         # Попытка 2: декодировать percent encoding и повторить
         try:
             init_decoded = urllib.parse.unquote_plus(init_data)
-            parsed = safe_parse_webapp_init_data(init_decoded, bot_token=settings.bot_token)
+            parsed = safe_parse_webapp_init_data(init_data=init_decoded, bot_token=settings.bot_token)
             user = parsed.user
         except Exception:
             # Попытка 3: разбираем вручную без проверки подписи
