@@ -165,43 +165,41 @@ async def submit_selection(request: Request):
     if not init_data:
         logger.warning("Запрос без _auth")
         return JSONResponse({"error": "Missing _auth"}, status_code=400)
-    # Попытаемся декодировать и проверить _auth. Telegram отправляет initData
-    # в виде percent‑encoded строки. Если безопасный парсер (safe_parse_webapp_init_data)
-    # возвращает ошибку из‑за некорректной подписи или формата, мы декодируем
-    # строку и пытаемся снова. В крайнем случае разбираем _auth вручную
-    # без проверки подписи. Это позволит сохранять выбор в локальной среде,
-    # даже если подпись отсутствует.
-    import urllib.parse
-    import json as _json
+    # Попытаемся верифицировать подпись initData. Если подпись неверна
+    # (что может происходить, например, при тестировании без публичного
+    # доступа или когда бот работает в режиме разработчика), не будем
+    # отвечать ошибкой 403. Вместо этого попробуем извлечь идентификатор
+    # пользователя из строки _auth вручную. Это повышает устойчивость
+    # приложения и позволяет сохранять выбор даже при отсутствии
+    # корректной подписи.
     user = None
-    # Попытка 1: как есть
     try:
-        parsed = safe_parse_webapp_init_data(init_data=init_data, bot_token=settings.bot_token)
+        # Validate the init data using the bot token. В случае успеха
+        # parsed.user содержит объект TelegramUser
+        parsed = safe_parse_webapp_init_data(init_data, bot_token=settings.bot_token)
         user = parsed.user
     except Exception:
-        # Попытка 2: декодировать percent encoding и повторить
+        logger.warning("Не удалось проверить подпись init_data, пробуем разобрать вручную")
+        # Попытка разобрать _auth как строку query string и извлечь поле user
         try:
-            init_decoded = urllib.parse.unquote_plus(init_data)
-            parsed = safe_parse_webapp_init_data(init_data=init_decoded, bot_token=settings.bot_token)
-            user = parsed.user
+            from urllib.parse import parse_qs, unquote
+            import json as _json
+            # parse_qs декодирует percent‑encoding и возвращает dict значений списков
+            qs = parse_qs(init_data, keep_blank_values=True)
+            user_param = qs.get('user') or qs.get('tgWebAppUser')
+            if user_param:
+                # user_param является списком строк; берём первый элемент
+                user_json = unquote(user_param[0])
+                user_data = _json.loads(user_json)
+                class _SimpleUser:
+                    def __init__(self, data):
+                        self.id = int(data.get('id')) if data.get('id') is not None else None
+                        self.first_name = data.get('first_name')
+                        self.last_name = data.get('last_name')
+                        self.username = data.get('username')
+                user = _SimpleUser(user_data)
         except Exception:
-            # Попытка 3: разбираем вручную без проверки подписи
-            try:
-                init_decoded = urllib.parse.unquote_plus(init_data)
-                qs = urllib.parse.parse_qs(init_decoded)
-                user_json = qs.get('user', [None])[0]
-                if user_json:
-                    user_dict = _json.loads(user_json)
-                    # Создаём простой объект с атрибутом id
-                    class _SimpleUser:
-                        pass
-                    u = _SimpleUser()
-                    for k, v in user_dict.items():
-                        setattr(u, k, v)
-                    user = u
-            except Exception:
-                user = None
-    # Если пользователь не распознан, возвращаем ошибку
+            user = None
     if user is None or getattr(user, 'id', None) is None:
         return JSONResponse({"error": "Invalid user"}, status_code=403)
     # Determine group_id and selected data

@@ -4,7 +4,9 @@ Middleware: проверяем, зарегистрирован ли пользо
 from aiogram import BaseMiddleware
 from aiogram.types import Message, CallbackQuery
 
-from database import get_user
+# Используем общую базу данных из пакета ``app``, чтобы
+# middleware проверяло регистрацию в едином хранилище пользователей.
+from app.database import get_user
 
 class AuthRequiredMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):

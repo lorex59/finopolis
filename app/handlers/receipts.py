@@ -5,11 +5,24 @@ from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, WebAppInfo
 
 from services.llm_api import extract_items_from_image
+# Используем общий модуль базы данных из пакета ``app``. Это исключает
+# дублирование кода и разделение данных между двумя разными файлами
+# database.py в корне проекта и в подпакете ``app``. Все функции
+# взаимодействия с базой данных импортируем из ``app.database``.
 from app.database import (
-    add_positions, get_positions, set_positions, init_assignments, set_assignment,
-    get_assignments, start_text_session, append_text_message, end_text_session,
-    get_all_users, save_debts, save_selected_positions, get_selected_positions,
-    get_user, log_payment
+    add_positions,
+    get_positions,
+    set_positions,
+    init_assignments,
+    set_assignment,
+    get_assignments,
+    start_text_session,
+    append_text_message,
+    end_text_session,
+    get_all_users,
+    save_debts,
+    save_selected_positions,
+    get_selected_positions,
 )
 from keyboards import positions_keyboard
 from aiogram.fsm.context import FSMContext
@@ -19,8 +32,8 @@ from config import settings
 
 from utils import parse_position
 
-from database import get_user
-from database import get_all_users, save_debts, log_payment
+from app.database import get_user
+from app.database import get_all_users, save_debts, log_payment
 from services.payments import mass_pay
 from services.llm_api import calculate_debts_from_messages
 
@@ -465,7 +478,10 @@ async def finalize_receipt(msg: Message):
         return
 
     # 1. Попробуем использовать текстовый сценарий, если он завершён
-    from database import TEXT_SESSIONS
+    # Импортируем TEXT_SESSIONS из общего модуля базы данных. Это
+    # используется для хранения состояния текстовых сессий и должен
+    # ссылаться на единственный экземпляр структуры в ``app.database``.
+    from app.database import TEXT_SESSIONS
     session = TEXT_SESSIONS.get(receipt_id)
     if session and not session.get("collecting") and session.get("messages"):
         # items for LLM: convert positions to dict{name: price}

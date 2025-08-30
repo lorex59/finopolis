@@ -18,14 +18,18 @@ from aiogram import Router, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
 from services.llm_api import classify_message, classify_intent_llm
-from database import (
+# Используем единый модуль базы данных из пакета ``app`` для работы с
+# таблицами. Это предотвращает возникновение нескольких экземпляров
+# ``database.py`` в разных местах проекта и гарантирует, что и бот, и
+# мини‑приложение используют одну и ту же БД.
+from app.database import (
     get_positions,
     start_text_session,
     append_text_message,
     end_text_session,
     TEXT_SESSIONS,
+    get_user,
 )
-from database import get_user
 
 from handlers.receipts import finalize_receipt
 
