@@ -659,8 +659,9 @@ async def cmd_pay(msg: Message):
     text = msg.text or ""
     parts = text.split(maxsplit=2)
     if len(parts) < 2:
+        # Убираем угловые скобки, чтобы избежать ошибки парсинга HTML от Telegram
         await msg.answer(
-            "Использование: /pay <сумма> [описание позиций]"
+            "Использование: /pay сумма [описание позиций]"
         )
         return
     amount_str = parts[1].replace(",", ".")
