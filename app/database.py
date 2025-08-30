@@ -114,6 +114,19 @@ def init_db() -> None:
             price REAL,
             FOREIGN KEY (position_id) REFERENCES positions(id)
         );
+
+        -- Новая таблица для хранения внесённых платежей. Сохраняем, кто
+        -- внёс платёж (tg_user_id), для какой группы (group_id), сумму
+        -- платежа (amount) и опциональное описание или список позиций,
+        -- за которые был внесён платёж (positions). Формат поля
+        -- positions: JSON‑строка или произвольный текст.
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_user_id TEXT,
+            group_id TEXT,
+            amount REAL,
+            positions TEXT
+        );
         """
     )
     conn.commit()
@@ -760,3 +773,200 @@ def end_text_session(receipt_id: str) -> list[str]:
     session = TEXT_SESSIONS.get(receipt_id, {"collecting": False, "messages": []})
     session["collecting"] = False
     return session.get("messages", [])
+
+# ---------------------------------------------------------------------------
+# Новые функции для учёта платежей и расчёта баланса
+# ---------------------------------------------------------------------------
+
+def add_payment(group_id: str, tg_user_id: int, amount: float, positions: list[dict] | str | None = None) -> None:
+    """
+    Добавляет запись о платеже в таблицу payments.
+
+    Args:
+        group_id: Идентификатор группы (чата).
+        tg_user_id: Идентификатор пользователя Telegram, внесшего платёж.
+        amount: Сумма платежа (в рублях). Может быть положительной или нулевой.
+        positions: Список позиций (словарей) или строка с описанием, за которые был внесён платёж.
+                   Если передан список, он будет сериализован в JSON. Если передана строка,
+                   она будет сохранена как есть. Если None, поле positions будет NULL.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Преобразуем positions в строку, если необходимо
+    pos_value: str | None
+    if positions is None:
+        pos_value = None
+    elif isinstance(positions, str):
+        pos_value = positions
+    else:
+        try:
+            pos_value = json.dumps(positions, ensure_ascii=False)
+        except Exception:
+            # В случае ошибки сериализации сохраняем строковое представление
+            pos_value = str(positions)
+    cur.execute(
+        "INSERT INTO payments (tg_user_id, group_id, amount, positions) VALUES (?, ?, ?, ?)",
+        (str(tg_user_id), str(group_id), float(amount), pos_value),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_payments(group_id: str) -> dict[int, float]:
+    """
+    Возвращает суммы внесённых платежей для указанной группы.
+
+    Args:
+        group_id: Идентификатор группы (чата).
+
+    Returns:
+        dict[int, float]: отображение user_id → суммарная сумма платежей.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT tg_user_id, SUM(amount) AS total_amount FROM payments WHERE group_id = ? GROUP BY tg_user_id",
+        (str(group_id),),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    result: dict[int, float] = {}
+    for row in rows:
+        uid_raw = row["tg_user_id"]
+        total = row["total_amount"] or 0.0
+        try:
+            uid = int(uid_raw) if uid_raw is not None else None
+        except Exception:
+            uid = None
+        if uid is None:
+            continue
+        result[uid] = float(total)
+    return result
+
+
+def get_unassigned_positions(group_id: str) -> list[dict]:
+    """
+    Проверяет, все ли позиции из чека распределены участниками.
+
+    Для каждой исходной позиции из таблицы positions сравнивается исходное
+    количество (quantity) с суммарным количеством, выбранным участниками
+    (selected_positions). Если выбранное количество меньше исходного,
+    позиция считается неразделённой. Возвращает список таких позиций
+    с указанием оставшегося количества.
+
+    Args:
+        group_id: Идентификатор группы.
+
+    Returns:
+        list[dict]: список словарей {"name": str, "quantity": float, "price": float}
+        для неразделённых позиций. Если все позиции распределены, список пуст.
+    """
+    # Загружаем исходные позиции из базы
+    original_positions = get_positions(group_id) or []
+    # Загружаем выбранные позиции пользователей
+    selections = get_selected_positions(group_id) or {}
+    # Суммируем выбранные количества для каждой позиции по ключу (name, price)
+    selected_qty: dict[tuple[str, float], float] = {}
+    for pos_list in selections.values():
+        for pos in pos_list:
+            key = (pos.get("name"), float(pos.get("price", 0)))
+            qty = float(pos.get("quantity", 0))
+            selected_qty[key] = selected_qty.get(key, 0.0) + qty
+    unassigned: list[dict] = []
+    for orig in original_positions:
+        key = (orig.get("name"), float(orig.get("price", 0)))
+        orig_qty = float(orig.get("quantity", 0))
+        # Сколько уже выбрали
+        chosen = selected_qty.get(key, 0.0)
+        remaining = orig_qty - chosen
+        # Считаем, что погрешности менее 0.01 можно игнорировать
+        if remaining > 0.01:
+            # Добавляем позицию с оставшимся количеством и той же ценой
+            unassigned.append({
+                "name": orig.get("name"),
+                "quantity": round(remaining, 2),
+                "price": float(orig.get("price", 0)),
+            })
+    return unassigned
+
+
+def calculate_group_balance(group_id: str) -> list[tuple[int, int, float]]:
+    """
+    Рассчитывает оптимальные переводы между участниками, чтобы покрыть
+    расходы, исходя из выбранных позиций и внесённых платежей.
+
+    Алгоритм:
+      1. Подсчитать стоимость выбранных позиций для каждого пользователя.
+      2. Подсчитать, сколько каждый пользователь заплатил (payments).
+      3. Для каждого участника вычислить баланс: balance = paid - cost.
+         Положительный баланс означает, что пользователь должен получить
+         деньги; отрицательный — что он должен заплатить.
+      4. Построить список минимального количества переводов между
+         должниками и кредиторами. Каждый элемент списка имеет вид
+         (debtor_id, creditor_id, amount), что означает, что должник
+         debtor_id должен перевести amount рублей кредитору creditor_id.
+
+    Args:
+        group_id: Идентификатор группы.
+
+    Returns:
+        list[tuple[int, int, float]]: список переводов. Может быть пустым,
+        если нет долгов или все балансы нулевые.
+    """
+    # 1. Считаем стоимость выбранных позиций для каждого пользователя
+    selections = get_selected_positions(group_id) or {}
+    cost_map: dict[int, float] = {}
+    for uid, pos_list in selections.items():
+        total = 0.0
+        for pos in pos_list:
+            try:
+                qty = float(pos.get("quantity", 0))
+                price = float(pos.get("price", 0))
+                total += qty * price
+            except Exception:
+                pass
+        cost_map[uid] = round(total, 2)
+    # 2. Считаем внесённые платежи
+    payments_map = get_payments(group_id) or {}
+    # 3. Список всех участников (те, кто что‑то выбрал или оплатил)
+    all_users: set[int] = set(cost_map.keys()) | set(payments_map.keys())
+    # 3. Вычисляем баланс для каждого участника
+    balances: dict[int, float] = {}
+    for uid in all_users:
+        paid = payments_map.get(uid, 0.0)
+        cost = cost_map.get(uid, 0.0)
+        balances[uid] = round(paid - cost, 2)
+    # 4. Формируем списки должников и кредиторов
+    debtors: list[list] = []  # [user_id, amount_owed]
+    creditors: list[list] = []  # [user_id, amount_to_receive]
+    for uid, bal in balances.items():
+        if bal < -0.01:  # должен
+            debtors.append([uid, round(-bal, 2)])
+        elif bal > 0.01:  # кредитор
+            creditors.append([uid, round(bal, 2)])
+    # Сортируем по сумме, чтобы оптимизировать количество переводов
+    debtors.sort(key=lambda x: x[1], reverse=True)
+    creditors.sort(key=lambda x: x[1], reverse=True)
+    transfers: list[tuple[int, int, float]] = []
+    i = 0
+    j = 0
+    # Используем два указателя для прохода по спискам
+    while i < len(debtors) and j < len(creditors):
+        d_uid, d_amount = debtors[i]
+        c_uid, c_amount = creditors[j]
+        # Определяем сумму перевода
+        transfer_amount = round(min(d_amount, c_amount), 2)
+        if transfer_amount <= 0:
+            # Если что‑то пошло не так, просто выходим
+            break
+        transfers.append((d_uid, c_uid, transfer_amount))
+        # Обновляем остатки
+        debtors[i][1] = round(d_amount - transfer_amount, 2)
+        creditors[j][1] = round(c_amount - transfer_amount, 2)
+        # Если должник погасил долг, переходим к следующему должнику
+        if debtors[i][1] <= 0.01:
+            i += 1
+        # Если кредитор получил всё, переходим к следующему кредитору
+        if creditors[j][1] <= 0.01:
+            j += 1
+    return transfers

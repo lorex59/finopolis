@@ -34,6 +34,14 @@ from utils import parse_position
 
 from app.database import get_user
 from app.database import get_all_users, save_debts, log_payment
+
+# Импортируем новые функции для платежей и расчёта баланса
+from app.database import (
+    add_payment,
+    get_payments,
+    calculate_group_balance,
+    get_unassigned_positions,
+)
 from services.payments import mass_pay
 from services.llm_api import calculate_debts_from_messages
 
@@ -620,3 +628,133 @@ async def finalize_receipt(msg: Message):
         name = user_info.get('full_name') or user_info.get('phone') or str(user_id)
         text_lines.append(f"{name} ({user_id}) → {amount}₽")
     await msg.answer("\n".join(text_lines), parse_mode="HTML")
+
+
+# ---------------------------------------------------------------------------
+# Дополнительные команды для учёта платежей и расчёта баланса
+# ---------------------------------------------------------------------------
+
+@router.message(Command("pay"))
+async def cmd_pay(msg: Message):
+    """
+    Записывает факт оплаты от пользователя.
+
+    Использование:
+      /pay <сумма> [описание]
+
+    Пример: /pay 1500 Обед и напитки
+
+    Сумма может быть десятичным числом (разделитель точки или запятая).
+    Описание является необязательным и будет сохранено как текст.
+    """
+    group_id = str(msg.chat.id)
+    user_id = msg.from_user.id
+    # Проверяем, что пользователь зарегистрирован
+    if get_user(user_id) is None:
+        await msg.answer(
+            "❗️Вы ещё не зарегистрированы. Напишите /start в личку боту, чтобы пройти регистрацию."
+        )
+        return
+    # Разбираем аргументы команды
+    text = msg.text or ""
+    parts = text.split(maxsplit=2)
+    if len(parts) < 2:
+        await msg.answer(
+            "Использование: /pay <сумма> [описание позиций]"
+        )
+        return
+    amount_str = parts[1].replace(",", ".")
+    try:
+        amount = float(amount_str)
+    except Exception:
+        await msg.answer("Сумма должна быть числом. Пример: /pay 100.50")
+        return
+    description = parts[2] if len(parts) >= 3 else None
+    try:
+        add_payment(group_id, user_id, amount, description)
+        await msg.answer(f"✅ Платёж на сумму {amount}₽ зарегистрирован.")
+    except Exception as e:
+        await msg.answer(f"Ошибка при сохранении платежа: {e}")
+
+
+@router.message(Command("unassigned"))
+async def cmd_unassigned(msg: Message):
+    """
+    Показывает список позиций из чека, которые ещё не были выбраны ни одним участником.
+
+    Команда полезна для контроля распределения: если остались строки, их
+    необходимо распределить, иначе баланс может быть рассчитан некорректно.
+    """
+    group_id = str(msg.chat.id)
+    unassigned = get_unassigned_positions(group_id) or []
+    if not unassigned:
+        await msg.answer("Все позиции распределены.")
+        return
+    lines: list[str] = ["<b>Неразделённые позиции:</b>"]
+    for pos in unassigned:
+        try:
+            name = pos.get("name")
+            qty = pos.get("quantity")
+            price = pos.get("price")
+            lines.append(f"{name} ({qty} × {price}₽)")
+        except Exception:
+            pass
+    await msg.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("balance"))
+async def cmd_balance(msg: Message):
+    """
+    Рассчитывает баланс группы и предлагает оптимальные переводы между участниками.
+
+    Баланс считается на основе выбранных позиций (selected_positions) и
+    внесённых платежей (payments). Для каждого участника выводится,
+    сколько он потратил по выбранным позициям, сколько внёс платежей и
+    итоговый баланс. Далее перечисляются переводы: кто, кому и сколько
+    должен перевести, чтобы закрыть долги.
+    """
+    group_id = str(msg.chat.id)
+    # Загружаем данные
+    selections = get_selected_positions(group_id) or {}
+    payments_map = get_payments(group_id) or {}
+    # Если нет данных ни о позициях, ни о платежах
+    if not selections and not payments_map:
+        await msg.answer("Нет данных для расчёта баланса. Сначала распределите позиции или внесите платежи.")
+        return
+    # Формируем cost_map: пользователь → сумма по выбранным позициям
+    cost_map: dict[int, float] = {}
+    for uid, pos_list in selections.items():
+        total = 0.0
+        for pos in pos_list:
+            try:
+                qty = float(pos.get("quantity", 0))
+                price = float(pos.get("price", 0))
+                total += qty * price
+            except Exception:
+                pass
+        cost_map[uid] = round(total, 2)
+    # Список всех участников
+    users = set(cost_map.keys()) | set(payments_map.keys())
+    # Строим строки с балансом по каждому
+    lines: list[str] = ["<b>Баланс группы:</b>"]
+    for uid in users:
+        spent = cost_map.get(uid, 0.0)
+        paid = payments_map.get(uid, 0.0)
+        diff = round(paid - spent, 2)
+        user_info = get_user(uid) or {}
+        name = user_info.get('full_name') or user_info.get('phone') or str(uid)
+        sign = "+" if diff >= 0 else ""
+        lines.append(f"{name} ({uid}): потратил {spent}₽, оплатил {paid}₽ → баланс {sign}{diff}₽")
+    # Получаем оптимальные переводы
+    transfers = calculate_group_balance(group_id)
+    if transfers:
+        lines.append("\n<b>Оптимальные переводы:</b>")
+        for debtor_id, creditor_id, amount in transfers:
+            debtor_info = get_user(debtor_id) or {}
+            creditor_info = get_user(creditor_id) or {}
+            debtor_name = debtor_info.get('full_name') or debtor_info.get('phone') or str(debtor_id)
+            creditor_name = creditor_info.get('full_name') or creditor_info.get('phone') or str(creditor_id)
+            lines.append(f"{debtor_name} → {creditor_name}: {amount}₽")
+    else:
+        lines.append("\nВсе расчёты закрыты. Нет обязательств между участниками.")
+    await msg.answer("\n".join(lines), parse_mode="HTML")
