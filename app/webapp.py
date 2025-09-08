@@ -212,13 +212,16 @@ async def submit_selection(request: Request):
     # Build list of indices from selected_data
     indices: list[int] = []
     if isinstance(selected_data, dict):
+        # qty может быть дробным значением. Сохраняем как float.
         for idx_str, qty in selected_data.items():
             try:
                 idx = int(idx_str)
-                q = int(float(qty))
+                q_raw = float(qty)
             except Exception:
                 continue
-            for _ in range(max(q, 0)):
+            # Для совместимости разворачиваем только целую часть количества.
+            count = int(q_raw) if q_raw > 0 else 0
+            for _ in range(count):
                 indices.append(idx)
     elif isinstance(selected_data, list):
         for i in selected_data:
@@ -236,14 +239,14 @@ async def submit_selection(request: Request):
             for idx_str, qty in selected_data.items():
                 try:
                     idx = int(idx_str)
-                    q = int(float(qty))
+                    q_raw = float(qty)
                 except Exception:
                     continue
-                if 0 <= idx < len(all_positions) and q > 0:
+                if 0 <= idx < len(all_positions) and q_raw > 0:
                     orig = all_positions[idx]
                     selected_positions.append({
                         "name": orig.get("name"),
-                        "quantity": q,
+                        "quantity": q_raw,
                         "price": orig.get("price"),
                     })
         else:
@@ -252,7 +255,7 @@ async def submit_selection(request: Request):
                     orig = all_positions[idx]
                     selected_positions.append({
                         "name": orig.get("name"),
-                        "quantity": 1,
+                        "quantity": 1.0,
                         "price": orig.get("price"),
                     })
         logger.debug("Сохраняем выбранные позиции: %s", selected_positions)

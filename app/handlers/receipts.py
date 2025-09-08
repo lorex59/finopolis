@@ -1,4 +1,5 @@
 import io
+import sqlite3
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
@@ -292,13 +293,18 @@ async def handle_web_app_data(msg: Message):
         # разворачиваем количество в список индексов, чтобы далее считать
         # стоимость пользователя по каждому выбранному товару.
         if isinstance(selected_data, dict):
+            # В словаре qty может быть дробным значением. Сохраняем как float
             for idx_str, qty in selected_data.items():
                 try:
                     idx = int(idx_str)
-                    q = int(float(qty))
+                    q_raw = float(qty)
                 except Exception:
                     continue
-                for _ in range(max(q, 0)):
+                # Для совместимости со старым протоколом assignments
+                # добавляем индекс int(q_raw) раз. Дробную часть не учитываем,
+                # так как фактическое количество будет храниться в selected_positions.
+                count = int(q_raw) if q_raw > 0 else 0
+                for _ in range(count):
                     indices.append(idx)
         elif isinstance(selected_data, list):
             # Формат {selected: [0,1,2]}
@@ -320,26 +326,36 @@ async def handle_web_app_data(msg: Message):
     # to using the current chat ID (suitable for private chat usage).
     group_id = str(data.get("group_id") or msg.chat.id)
     receipt_id = group_id
+    # Сохраняем выбор пользователя в in‑memory assignments для совместимости
     set_assignment(receipt_id, msg.from_user.id, indices)
     try:
-        # Retrieve all positions for the identified group. Use list from storage.
+        # Получаем список всех позиций в текущей группе
         all_positions = get_positions(str(group_id))
         selected_positions: list[dict] = []
         if isinstance(selected_data, dict):
             for idx_str, qty in selected_data.items():
                 try:
                     idx = int(idx_str)
-                    q = int(float(qty))
+                    q_raw = float(qty)
                 except Exception:
                     continue
-                if 0 <= idx < len(all_positions) and q > 0:
+                # Проверяем индекс и количество
+                if 0 <= idx < len(all_positions) and q_raw > 0:
                     orig = all_positions[idx]
-                    selected_positions.append({"name": orig.get("name"), "quantity": q, "price": orig.get("price")})
+                    selected_positions.append({
+                        "name": orig.get("name"),
+                        "quantity": q_raw,
+                        "price": orig.get("price"),
+                    })
         else:
             for idx in indices:
                 if 0 <= idx < len(all_positions):
                     orig = all_positions[idx]
-                    selected_positions.append({"name": orig.get("name"), "quantity": 1, "price": orig.get("price")})
+                    selected_positions.append({
+                        "name": orig.get("name"),
+                        "quantity": 1.0,
+                        "price": orig.get("price"),
+                    })
         save_selected_positions(str(group_id), msg.from_user.id, selected_positions)
     except Exception as e:
         print(f"Ошибка при сохранении распределённых позиций: {e}")
@@ -544,38 +560,65 @@ async def finalize_receipt(msg: Message):
     # 2. Если у нас есть назначения из WebApp
     assignments = get_assignments(receipt_id)
     if assignments:
-        # При выборе позиций в мини‑приложении рассчитываем стоимость каждой позиции как цену за одну единицу.
-        # Это позволяет корректно подсчитать стоимость для пользователей, которые выбрали меньше исходного
-        # количества (например, из 4 одинаковых пива пользователь выбрал только 2).
-        cost_per_position: list[float] = []
-        for item in positions:
-            try:
-                # Цена за единицу
-                cost_per_position.append(float(item.get("price", 0)))
-            except Exception:
-                cost_per_position.append(0.0)
-        # Считаем сумму для каждого пользователя. В assignments индексы могут повторяться,
-        # что отражает выбранное количество.
-        mapping: dict[int, float] = {user_id: 0.0 for user_id, _ in users}
-        for user_id, indices in assignments.items():
-            total = 0.0
-            for idx in indices:
-                if 0 <= idx < len(cost_per_position):
-                    total += cost_per_position[idx]
-            mapping[user_id] = round(total, 2)
-        # Определим плательщика (первый отправивший фото)
+        """
+        Для мини‑приложения используется таблица selected_positions, в которой
+        хранится фактическое количество и цена каждой выбранной позиции. Это
+        позволяет корректно учитывать дробные количества (например, 1.5) и
+        избегать ошибок, связанных с округлением количества до целого числа.
+
+        Если в базе для данной группы присутствуют записи selected_positions,
+        то расчёт производится на их основе: для каждого пользователя
+        суммируется количество * цена по всем выбранным позициям. В противном
+        случае выполняется fallback к расчёту по assignments, где индексы
+        повторяются согласно выбранному количеству (как в предыдущих
+        версиях).
+        """
+        from app.database import get_selected_positions as _get_selected_positions
+        # Попробуем получить детальное распределение
+        selections = _get_selected_positions(group_id)
+        mapping: dict[int, float] = {}
+        if selections:
+            # Суммируем стоимость для каждого пользователя
+            for uid, pos_list in selections.items():
+                total = 0.0
+                for pos in pos_list:
+                    try:
+                        qty = float(pos.get("quantity", 0))
+                        price = float(pos.get("price", 0))
+                        total += qty * price
+                    except Exception:
+                        pass
+                mapping[uid] = round(total, 2)
+        else:
+            # Фолбэк: используем assignments (целочисленное количество)
+            cost_per_position: list[float] = []
+            for item in positions:
+                try:
+                    cost_per_position.append(float(item.get("price", 0)))
+                except Exception:
+                    cost_per_position.append(0.0)
+            # Инициализируем нулевыми
+            mapping = {user_id: 0.0 for user_id, _ in users}
+            for user_id, indices in assignments.items():
+                total = 0.0
+                for idx in indices:
+                    if 0 <= idx < len(cost_per_position):
+                        total += cost_per_position[idx]
+                mapping[user_id] = round(total, 2)
+        # Определяем плательщика (тот, кто вызвал /finalize)
         payer_id = msg.from_user.id
-        # Преобразуем mapping в формат "кто сколько кому должен": все кроме payer должны payer
         debt_mapping: dict[int, float] = {}
         for uid, amount in mapping.items():
+            # Пропускаем плательщика: он ничего не должен самому себе
             if uid == payer_id:
                 continue
             debt_mapping[uid] = amount
-        # Выполняем платёж и логируем его
+        # Выполняем перевод и логируем
         tx_id = await mass_pay(debt_mapping)
+        # Сохраняем рассчитанные долги в базу
         save_debts(receipt_id, debt_mapping)
         log_payment(receipt_id, tx_id, debt_mapping)
-        # Очищаем список позиций, чтобы следующий расчёт был независим
+        # Очищаем позиции, чтобы следующий расчёт был независим
         set_positions(group_id, [])
         # Уведомляем каждого должника персонально
         for uid, amount in debt_mapping.items():
@@ -587,7 +630,7 @@ async def finalize_receipt(msg: Message):
                 await msg.bot.send_message(uid, f"{name}, вы должны {amount}₽ пользователю {payer_name}.")
             except Exception:
                 pass
-        # Подготовим текст для группового чата с именами
+        # Подготовим текст для группового чата
         text_lines = ["💰 Расчёт завершён!", f"ID транзакции: {tx_id}"]
         text_lines.append("\nСуммы к оплате:")
         for uid, amount in debt_mapping.items():
@@ -759,3 +802,98 @@ async def cmd_balance(msg: Message):
     else:
         lines.append("\nВсе расчёты закрыты. Нет обязательств между участниками.")
     await msg.answer("\n".join(lines), parse_mode="HTML")
+
+# ---------------------------------------------------------------------------
+# Команды для просмотра содержимого таблиц базы данных
+# ---------------------------------------------------------------------------
+
+def _format_rows(columns: list[str], rows: list[sqlite3.Row]) -> str:
+    """
+    Вспомогательная функция для форматирования выборки из БД в строку.
+
+    Args:
+        columns: список названий столбцов
+        rows: список строк (sqlite3.Row)
+    Returns:
+        Готовую строку, где каждая строка представлена в формате key: value;
+        разделитель между записями — перевод строки.
+    """
+    if not rows:
+        return "(нет записей)"
+    lines: list[str] = []
+    for row in rows:
+        parts = []
+        for col in columns:
+            parts.append(f"{col}={row[col]}")
+        lines.append(", ".join(parts))
+    return "\n".join(lines)
+
+
+@router.message(Command("accounts"))
+async def cmd_show_accounts(msg: Message):
+    """Показывает список записей в таблице accounts."""
+    from app.database import get_db_connection
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, phone_number, full_name, telegram_login, bank, telegram_id FROM accounts")
+    rows = cur.fetchall()
+    conn.close()
+    columns = ["id", "phone_number", "full_name", "telegram_login", "bank", "telegram_id"]
+    text = _format_rows(columns, rows)
+    await msg.answer(f"<b>Таблица accounts:</b>\n{text}", parse_mode="HTML")
+
+
+@router.message(Command("positions_db"))
+async def cmd_show_positions_db(msg: Message):
+    """Показывает содержимое таблицы positions."""
+    from app.database import get_db_connection
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, group_id, name, quantity, price FROM positions ORDER BY id")
+    rows = cur.fetchall()
+    conn.close()
+    columns = ["id", "group_id", "name", "quantity", "price"]
+    text = _format_rows(columns, rows)
+    await msg.answer(f"<b>Таблица positions:</b>\n{text}", parse_mode="HTML")
+
+
+@router.message(Command("selected_positions_db"))
+async def cmd_show_selected_positions_db(msg: Message):
+    """Показывает содержимое таблицы selected_positions."""
+    from app.database import get_db_connection
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, group_id, user_tg_id, position_id, quantity, price FROM selected_positions ORDER BY id")
+    rows = cur.fetchall()
+    conn.close()
+    columns = ["id", "group_id", "user_tg_id", "position_id", "quantity", "price"]
+    text = _format_rows(columns, rows)
+    await msg.answer(f"<b>Таблица selected_positions:</b>\n{text}", parse_mode="HTML")
+
+
+@router.message(Command("payments_db"))
+async def cmd_show_payments_db(msg: Message):
+    """Показывает содержимое таблицы payments."""
+    from app.database import get_db_connection
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, tg_user_id, group_id, amount, positions FROM payments ORDER BY id")
+    rows = cur.fetchall()
+    conn.close()
+    columns = ["id", "tg_user_id", "group_id", "amount", "positions"]
+    text = _format_rows(columns, rows)
+    await msg.answer(f"<b>Таблица payments:</b>\n{text}", parse_mode="HTML")
+
+
+@router.message(Command("debts_db"))
+async def cmd_show_debts_db(msg: Message):
+    """Показывает содержимое таблицы debts."""
+    from app.database import get_db_connection
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, receipt_id, user_tg_id, amount, created_at FROM debts ORDER BY id")
+    rows = cur.fetchall()
+    conn.close()
+    columns = ["id", "receipt_id", "user_tg_id", "amount", "created_at"]
+    text = _format_rows(columns, rows)
+    await msg.answer(f"<b>Таблица debts:</b>\n{text}", parse_mode="HTML")

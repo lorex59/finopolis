@@ -207,7 +207,9 @@
           input.type = 'number';
           input.min = '0';
           input.max = String(maxQty);
-          input.step = '1';
+          // Разрешаем ввод дробных количеств. Шаг 0.1 обеспечивает ввод
+          // нецелых значений, но пользователь может ввести любое число вручную.
+          input.step = '0.1';
           input.value = '0';
           const plusBtn = document.createElement('button');
           plusBtn.type = 'button';
@@ -223,9 +225,12 @@
           }
           minusBtn.addEventListener('click', (ev) => {
             ev.stopPropagation();
-            let val = parseInt(input.value) || 0;
+            let val = parseFloat(input.value) || 0;
             if (val > 0) {
-              val--;
+              val = val - 1;
+              if (val < 0) val = 0;
+              // Округляем до двух знаков для предотвращения длинных хвостов
+              val = Math.round(val * 100) / 100;
               input.value = String(val);
               updateSelection(val);
               updateSummary(selectedQuantities, positions, summaryEl);
@@ -233,18 +238,22 @@
           });
           plusBtn.addEventListener('click', (ev) => {
             ev.stopPropagation();
-            let val = parseInt(input.value) || 0;
+            let val = parseFloat(input.value) || 0;
             if (val < maxQty) {
-              val++;
+              val = val + 1;
+              if (val > maxQty) val = maxQty;
+              val = Math.round(val * 100) / 100;
               input.value = String(val);
               updateSelection(val);
               updateSummary(selectedQuantities, positions, summaryEl);
             }
           });
           input.addEventListener('input', () => {
-            let val = parseInt(input.value) || 0;
+            let val = parseFloat(input.value) || 0;
             if (val < 0) val = 0;
             if (val > maxQty) val = maxQty;
+            // Округляем ввод до двух знаков после запятой
+            val = Math.round(val * 100) / 100;
             input.value = String(val);
             updateSelection(val);
             updateSummary(selectedQuantities, positions, summaryEl);
@@ -253,9 +262,11 @@
             if (ev.target === minusBtn || ev.target === plusBtn || ev.target === input) {
               return;
             }
-            let val = parseInt(input.value) || 0;
+            let val = parseFloat(input.value) || 0;
             if (val < maxQty) {
-              val++;
+              val = val + 1;
+              if (val > maxQty) val = maxQty;
+              val = Math.round(val * 100) / 100;
               input.value = String(val);
               updateSelection(val);
               updateSummary(selectedQuantities, positions, summaryEl);

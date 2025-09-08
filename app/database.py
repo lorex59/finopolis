@@ -127,6 +127,23 @@ def init_db() -> None:
             amount REAL,
             positions TEXT
         );
+
+        -- Таблица для сохранения результатов расчётов долей.
+        -- Каждая запись описывает, сколько пользователь должен
+        -- заплатить по итогам расчёта для конкретного чека (receipt).
+        -- Поля:
+        --   id          — первичный ключ
+        --   receipt_id  — идентификатор расчёта (чаще всего совпадает с chat.id группы)
+        --   user_tg_id  — идентификатор пользователя, который должен заплатить
+        --   amount      — сумма долга пользователя (в рублях)
+        --   created_at  — время создания записи (UTC)
+        CREATE TABLE IF NOT EXISTS debts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            receipt_id TEXT,
+            user_tg_id TEXT,
+            amount REAL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
         """
     )
     conn.commit()
@@ -620,12 +637,43 @@ def save_receipt(receipt_id: str, items: dict[str, float]) -> None:
     pass
 
 def save_debts(receipt_id: str, mapping: dict[int, float]) -> None:
-    """Сохраняет расчётные долги для чека.
+    """Сохраняет расчётные долги для указанного расчёта (чека).
 
-    В текущей реализации данные о долгах не сохраняются. Для хранения
-    результатов расчёта реализуйте запись в отдельную таблицу базы данных.
+    Каждая пара ``user_id → amount`` из переданного ``mapping`` вставляется
+    в таблицу ``debts``. Существующие записи для данного ``receipt_id``
+    предварительно удаляются, чтобы избежать дублирования. При
+    необходимости более тонкого контроля (например, хранения истории
+    расчётов) можно вместо удаления добавлять новые записи с новой
+    меткой времени.
+
+    Args:
+        receipt_id: идентификатор расчёта/чека (обычно идентификатор
+            группового чата).
+        mapping: отображение user_id → сумма долга. Значения суммы
+            округляются до двух знаков после запятой.
     """
-    pass
+    # Открываем соединение с базой данных
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Удаляем существующие записи для данного чека. Это обеспечивает,
+    # что при повторном расчёте данные будут перезаписаны.
+    cur.execute(
+        "DELETE FROM debts WHERE receipt_id = ?",
+        (str(receipt_id),),
+    )
+    # Вставляем новые записи
+    for uid, amount in (mapping or {}).items():
+        try:
+            uid_str = str(uid)
+            amt = round(float(amount), 2)
+        except Exception:
+            continue
+        cur.execute(
+            "INSERT INTO debts (receipt_id, user_tg_id, amount) VALUES (?, ?, ?)",
+            (str(receipt_id), uid_str, amt),
+        )
+    conn.commit()
+    conn.close()
 
 """
 In‑memory storage for users, receipts, positions and assignments.
