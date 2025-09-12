@@ -44,20 +44,15 @@ llm = ChatOpenAI(
     model="qwen/qwen2.5-vl-72b-instruct:free",
     api_key=os.environ.get("OPENROUTER_API_KEY"),
     base_url="https://openrouter.ai/api/v1",
-    # При желании можно прокинуть служебные заголовки OpenRouter:
-    default_headers={
-        "HTTP-Referer": "http://localhost",   # опционально
-        "X-Title": "Receipt Parser",          # опционально
-    },
     temperature=0,
 )
+
 
 
 # 3) Оборачиваем LLM, чтобы он ВОЗВРАЩАЛ строго список Item
 structured_llm = llm.with_structured_output(
     ReceiptItems,
-    include_raw=True,
-    method="json_schema",   # важно: не function_calling
+    include_raw=True
 )
 
 
@@ -73,12 +68,13 @@ TEXT_POSITIONS_PROMPT = (
     "Если количество не указано — считай его равным 1. Цена может быть указана как просто число, число с суффиксом 'к' или 'k' (обозначающим тысячи), "
     "или сопровождаться словами 'руб', 'руб.', 'рублей', 'р', '₽'. Количество может находиться перед или после названия: '2 яблока по 50', 'яблока x2 50'. "
     "Если количество указано с помощью 'x' или '×', трактуй его как количество. Разделители между позициями могут быть запятая, точка, слово 'и', 'и ещё' и подобные. "
-    "Пример: 'Добавь такси 300 рублей' → [{\"name\": \"такси\", \"quantity\": 1, \"price\": 300}]. "
-    "Пример: 'дом 10к' → [{\"name\": \"дом\", \"quantity\": 1, \"price\": 10000}]. "
-    "Пример: 'хлеб x2 30 руб' → [{\"name\": \"хлеб\", \"quantity\": 2, \"price\": 30}]. "
+    "Пример: 'Добавь такси 300 рублей' → [{{\"name\": \"такси\", \"quantity\": 1, \"price\": 300}}]. "
+    "Пример: 'дом 10к' → [{{\"name\": \"дом\", \"quantity\": 1, \"price\": 10000}}]. "
+    "Пример: 'хлеб x2 30 руб' → [{{\"name\": \"хлеб\", \"quantity\": 2, \"price\": 30}}]. "
     "Не добавляй никаких пояснений, только JSON‑массив. "
     "Текст: {text}"
 )
+
 
 async def extract_items_from_image(image_bin: io.BytesIO):
     """
