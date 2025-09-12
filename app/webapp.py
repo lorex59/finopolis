@@ -216,7 +216,7 @@ async def submit_selection(request: Request):
         for idx_str, qty in selected_data.items():
             try:
                 idx = int(idx_str)
-                q_raw = float(qty)
+                q_raw = float(qty) if not isinstance(qty, str) else (1.0 if qty.strip().lower()=='even' else 0.0)
             except Exception:
                 continue
             # Для совместимости разворачиваем только целую часть количества.
@@ -239,7 +239,7 @@ async def submit_selection(request: Request):
             for idx_str, qty in selected_data.items():
                 try:
                     idx = int(idx_str)
-                    q_raw = float(qty)
+                    q_raw = float(qty) if not isinstance(qty, str) else (1.0 if qty.strip().lower()=='even' else 0.0)
                 except Exception:
                     continue
                 if 0 <= idx < len(all_positions) and q_raw > 0:

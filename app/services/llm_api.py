@@ -5,6 +5,7 @@
 """
 import aiohttp
 from typing import BinaryIO
+import re
 
 from config import settings
 
@@ -248,3 +249,124 @@ def classify_message(text: str) -> str:
     работать по старому механизму.
     """
     return classify_message_heuristic(text)
+
+
+# --- Text extraction for adding positions ------------------------------------
+
+TEXT_POSITIONS_PROMPT = """
+You are a parser. Extract shopping positions from the user's Russian text and return ONLY a JSON array.
+
+Each element must be an object with keys:
+- "name": string — short item title (2–6 words), Russian preferred.
+- "quantity": number — default 1 if not stated. Accept decimals (e.g., 0.5).
+- "price": number — unit price in RUB. If user gives total sum for multiple units, infer unit price = total / quantity.
+
+Rules:
+- Ignore chatter and greetings.
+- Russian input like "такси за 300" → [{"name":"такси","quantity":1,"price":300}]
+- "ещё за дом за 10к" → [{"name":"дом","quantity":1,"price":10000}]
+- Support slang like "к", "косарей" (= *1000).
+- If price currency not mentioned, assume RUB.
+- If nothing to extract, return [] (empty array).
+Output: STRICT JSON array, no comments.
+"""
+
+async def extract_items_from_text(text: str) -> list[dict]:
+    """
+    Parse free-form text into positions (name, quantity, price). Falls back to a
+    lightweight regex if the LLM is unavailable.
+    """
+    try:
+        headers = {
+            "Authorization": f"Bearer {settings.openrouter_api_key}",
+            "Content-Type": "application/json",
+        }
+        json_payload = {
+            "model": settings.openrouter_model or "anthropic/claude-3.5-sonnet",
+            "messages": [
+                {"role":"system","content": TEXT_POSITIONS_PROMPT},
+                {"role":"user","content": text},
+            ],
+            "temperature": 0.0,
+            "response_format": {"type":"json_object","schema": {"type":"array"}}
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://openrouter.ai/api/v1/chat/completions",
+                                    json=json_payload, headers=headers) as resp:
+                resp.raise_for_status()
+                result = await resp.json()
+                raw = result["choices"][0]["message"]["content"]
+                try:
+                    data = json.loads(raw)
+                    if isinstance(data, list):
+                        norm = []
+                        for it in data:
+                            name = str(it.get("name","")).strip()
+                            if not name:
+                                continue
+                            qty = float(it.get("quantity", 1) or 1)
+                            price = float(it.get("price", 0) or 0)
+                            norm.append({"name": name, "quantity": qty, "price": price})
+                        return norm
+                except Exception:
+                    pass
+    except Exception:
+        # fall back
+        pass
+    # Heuristic fallback: find fragments like "<word(s)> за <number>"
+    items = []
+    text_l = text.lower().replace(" ", " ")
+    # normalize "10к" -> 10000
+    def parse_amount(tok: str) -> float:
+        tok = tok.replace(" ", "")
+        m = re.match(r"(\d+(?:[.,]\d+)?)(k|к|тыс|тысяч|к?осар[ьяе]|т|тр)?", tok)
+        if not m:
+            return 0.0
+        num = float(m.group(1).replace(",", "."))
+        mul = m.group(2)
+        if mul:
+            return num * 1000.0
+        return num
+    for m in re.finditer(r"([а-яa-z0-9\s\-]+?)\s+за\s+(\d+[.,]?\d*\s*[кk]?)", text_l):
+        name = m.group(1).strip(" ,.-")
+        amt = parse_amount(m.group(2))
+        if name and amt>0:
+            items.append({"name": name, "quantity": 1.0, "price": float(amt)})
+    return items
+
+# Strengthen intent classifier prompt
+INTENT_PROMPT = """
+Classify the user's Russian message into one of intents:
+- "add_position" — they ask to add items/positions to the current receipt (e.g., 'добавь такси за 300', 'ещё кофе за 120', 'пиво 2 по 150').
+- "show_positions" — they want to show/display positions (/show_position, 'покажи позиции').
+- "calculate" — they want to calculate/settle debts ('посчитай', 'кто кому должен', 'итог').
+- "help" — help/about commands.
+- "unknown" — none of the above.
+
+Return ONLY the label string.
+"""
+
+async def classify_intent_llm(text: str) -> str:
+    try:
+        headers = {
+            "Authorization": f"Bearer {settings.openrouter_api_key}",
+            "Content-Type": "application/json",
+        }
+        json_payload = {
+            "model": settings.openrouter_model or "anthropic/claude-3.5-sonnet",
+            "messages": [
+                {"role":"system","content": INTENT_PROMPT},
+                {"role":"user","content": text},
+            ],
+            "temperature": 0.0,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://openrouter.ai/api/v1/chat/completions",
+                                    json=json_payload, headers=headers) as resp:
+                resp.raise_for_status()
+                result = await resp.json()
+                content = result["choices"][0]["message"]["content"].strip().lower()
+                content = re.sub(r"[^a-z_]+", "", content)
+                return content if content in {"add_position","show_positions","calculate","help","unknown"} else "unknown"
+    except Exception:
+        return classify_message_heuristic(text)

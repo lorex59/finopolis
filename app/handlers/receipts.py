@@ -897,3 +897,57 @@ async def cmd_show_debts_db(msg: Message):
     columns = ["id", "receipt_id", "user_tg_id", "amount", "created_at"]
     text = _format_rows(columns, rows)
     await msg.answer(f"<b>Таблица debts:</b>\n{text}", parse_mode="HTML")
+
+
+
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from app.database import get_positions, get_selected_positions, calculate_group_balance
+
+@router.message(Command("show_position"))
+async def cmd_show_position_pretty(msg: Message):
+    group_id = str(msg.chat.id)
+    positions = get_positions(group_id) or []
+    selections = get_selected_positions(group_id) or {}
+    # Build who selected per position (by key name+price)
+    who = {}
+    for uid, items in selections.items():
+        for it in items:
+            key = (it.get("name"), float(it.get("price",0)))
+            who.setdefault(key, set()).add(uid)
+    if not positions:
+        await msg.answer("Нет позиций. Пришлите фото чека или добавьте текстом.")
+        return
+    lines = []
+    for i, p in enumerate(positions, 1):
+        key = (p.get("name"), float(p.get("price",0)))
+        users = who.get(key, set())
+        chosen = len(users)
+        qty = p.get("quantity", 1)
+        price = p.get("price", 0)
+        users_txt = ", ".join([f"<code>{u}</code>" for u in sorted(users)]) if users else "—"
+        lines.append(f"{i}. <b>{p['name']}</b> — {qty} × {price}₽ — выбрали: {users_txt}")
+    await msg.answer("\n".join(lines), parse_mode="HTML")
+
+@router.message(Command("settle"))
+async def cmd_settle(msg: Message):
+    group_id = str(msg.chat.id)
+    transfers = calculate_group_balance(group_id) or []
+    if not transfers:
+        await msg.answer("Нечего рассчитывать — нет данных о выборах/платежах.")
+        return
+    # Build deep-link to group mini app
+    link = ""
+    if settings.bot_username:
+        link = f"https://t.me/{settings.bot_username}?startapp=group_{group_id}"
+    # Notify each debtor privately
+    sent_to = set()
+    for debtor, creditor, amount in transfers:
+        text = f"Оплата: отправьте <b>{amount:.2f}₽</b> пользователю <code>{creditor}</code>."
+        if link:
+            text += f"\nГруппа: {link}"
+        try:
+            await msg.bot.send_message(chat_id=debtor, text=text, parse_mode="HTML")
+            sent_to.add(debtor)
+        except Exception:
+            pass
+    await msg.answer(f"Результаты разосланы в личные сообщения ({len(sent_to)} пользователям).")

@@ -169,3 +169,32 @@ async def handle_nlu_message(msg: Message):
     await msg.answer(
         "Извините, я не понимаю. Напишите /help, чтобы узнать, что я умею."
     )
+
+
+from aiogram import Router, F
+from aiogram.filters import Command
+from aiogram.types import Message
+from services.llm_api import classify_intent_llm, extract_items_from_text
+from app.database import add_positions
+from config import settings
+
+nlu_router = Router(name="nlu")
+
+@nlu_router.message(F.text)
+async def handle_nlu_message(msg: Message):
+    text = msg.text or ""
+    # classify intent
+    intent = await classify_intent_llm(text)
+    if intent == "add_position":
+        items = await extract_items_from_text(text)
+        if not items:
+            await msg.answer("Не удалось распарсить позиции из текста.")
+            return
+        group_id = str(msg.chat.id)
+        # default quantity=1 if missing already handled
+        add_positions(group_id, items)
+        # pretty echo
+        lines = [f"• {it['name']} — {it.get('quantity',1)} × {it.get('price',0)}₽" for it in items]
+        await msg.answer("Добавил позиции:\n" + "\n".join(lines))
+        return
+    # other intents fall through to existing logic if present
