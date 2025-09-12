@@ -85,20 +85,7 @@
         background-color: #24963f;
       }
     </style>
-    <script src="https://telegram.org/js/telegram-web-app.js">
-document.querySelectorAll('.item').forEach((el) => {
-  const evenBtn = el.querySelector('.even-btn');
-  const input = el.querySelector('.quantity-input');
-  if (evenBtn && input) {
-    evenBtn.addEventListener('click', (ev) => {
-      ev.stopPropagation();
-      input.value = 'even';
-      el.classList.add('selected');
-    });
-  }
-});
-
-</script>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
   </head>
   <body>
     <h1>Выберите позиции, которые вы покупали</h1>

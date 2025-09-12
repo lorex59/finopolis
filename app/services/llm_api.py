@@ -5,7 +5,6 @@
 """
 import aiohttp
 from typing import BinaryIO
-import re
 
 from config import settings
 
@@ -65,6 +64,17 @@ structured_llm = llm.with_structured_output(
 PROMPT = (
     "Распознай этот чек и верни строго JSON массив объектов с полями "
     "`name` (строка), `quantity` (число), `price` (число). Только JSON-массив, без комментариев."
+)
+
+# Prompt template for extracting positions from a free‑form Russian text.
+TEXT_POSITIONS_PROMPT = (
+    "Ты — помощник, который извлекает список покупок из текста, написанного на русском. "
+    "Тебе нужно вернуть строго JSON‑массив объектов с полями name (строка), quantity (число) и price (число). "
+    "Если количество не указано — считать его равным 1. "
+    "Не добавляй никаких пояснений, только JSON‑массив. "
+    "Пример: пользователь пишет: «Добавь в позиции такси за 300 рублей и дом за 10к». "
+    "Ты возвращаешь: [{\"name\": \"такси\", \"quantity\": 1, \"price\": 300}, {\"name\": \"дом\", \"quantity\": 1, \"price\": 10000}]. "
+    "Текст: {text}"
 )
 
 async def extract_items_from_image(image_bin: io.BytesIO):
@@ -158,6 +168,7 @@ async def classify_intent_llm(text: str) -> str:
       - calculate: запрос на расчёт долга
       - delete_position: запрос на удаление позиции
       - edit_position: запрос на изменение позиции
+      - add_position: добавление новой позиции по тексту (например, "добавь в позиции такси за 300")
       - finalize: запрос на завершение расчёта
       - help: запрос на помощь
       - unknown: иное
@@ -166,6 +177,7 @@ async def classify_intent_llm(text: str) -> str:
     """
     # Если LLM не инициализирован, используем эвристику как раньше.
     if _text_llm is None:
+        # Если LLM недоступен, используем эвристику, чтобы не терять важные намерения
         return classify_message_heuristic(text)
     # Системное сообщение описывает задачу классификации. Мы просим модель
     # ответить только одним словом без точек и лишних символов. Это упрощает
@@ -173,7 +185,7 @@ async def classify_intent_llm(text: str) -> str:
     system_prompt = (
         "Ты помощник по классификации. Категоризируй пользовательский запрос "
         "на одну из категорий: greet, list_positions, calculate, delete_position, "
-        "edit_position, finalize, help, unknown. Ответь только названием категории "
+        "edit_position, add_position, finalize, help, unknown. Ответь только названием категории "
         "без других слов.\n"
     )
     # Формируем список сообщений для модели: системное и пользовательское
@@ -195,6 +207,7 @@ async def classify_intent_llm(text: str) -> str:
             "calculate",
             "delete_position",
             "edit_position",
+            "add_position",
             "finalize",
             "help",
             "unknown",
@@ -219,6 +232,11 @@ def classify_message_heuristic(text: str) -> str:
     # приветствие
     if any(word in lowered for word in ["привет", "здравств", "ку", "hello", "hi"]):
         return "greet"
+    # добавление позиции: проверяем до списка, чтобы избежать перехвата слова "позиции"
+    if any(word in lowered for word in ["добав", "добавь", "добавить", "прибав", "прибавь"]):
+        # фразы вроде "добавь", "хочу добавить", "добавь позицию" указывают на необходимость
+        # добавить новые позиции по тексту. Возвращаем add_position.
+        return "add_position"
     # запрос списка позиций
     if any(word in lowered for word in ["список", "позиции", "товары", "что", "добавлено", "покажи"]):
         return "list_positions"
@@ -250,123 +268,129 @@ def classify_message(text: str) -> str:
     """
     return classify_message_heuristic(text)
 
-
-# --- Text extraction for adding positions ------------------------------------
-
-TEXT_POSITIONS_PROMPT = """
-You are a parser. Extract shopping positions from the user's Russian text and return ONLY a JSON array.
-
-Each element must be an object with keys:
-- "name": string — short item title (2–6 words), Russian preferred.
-- "quantity": number — default 1 if not stated. Accept decimals (e.g., 0.5).
-- "price": number — unit price in RUB. If user gives total sum for multiple units, infer unit price = total / quantity.
-
-Rules:
-- Ignore chatter and greetings.
-- Russian input like "такси за 300" → [{"name":"такси","quantity":1,"price":300}]
-- "ещё за дом за 10к" → [{"name":"дом","quantity":1,"price":10000}]
-- Support slang like "к", "косарей" (= *1000).
-- If price currency not mentioned, assume RUB.
-- If nothing to extract, return [] (empty array).
-Output: STRICT JSON array, no comments.
-"""
-
-async def extract_items_from_text(text: str) -> list[dict]:
+# ---------------------------------------------------------------------------
+# Новый функционал: разбор позиций из текстовых сообщений через LLM
+# ---------------------------------------------------------------------------
+async def extract_items_from_text(text: str) -> list[Item]:
     """
-    Parse free-form text into positions (name, quantity, price). Falls back to a
-    lightweight regex if the LLM is unavailable.
+    Извлекает список позиций из свободного текста с помощью LLM.
+
+    Принимает текстовое сообщение от пользователя, которое содержит названия
+    товаров, их количество и цену. Возвращает список объектов Item. Для разбора
+    используется json_schema, поэтому модель вернёт строго список Item в
+    соответствии со схемой. Если количество в тексте не указано, считается 1.
+
+    Args:
+        text: строка с описанием покупок
+
+    Returns:
+        list[Item]: список распознанных позиций
+
+    Raises:
+        любое исключение, возникающее при вызове structured_llm
     """
-    try:
-        headers = {
-            "Authorization": f"Bearer {settings.openrouter_api_key}",
-            "Content-Type": "application/json",
-        }
-        json_payload = {
-            "model": settings.openrouter_model or "anthropic/claude-3.5-sonnet",
-            "messages": [
-                {"role":"system","content": TEXT_POSITIONS_PROMPT},
-                {"role":"user","content": text},
-            ],
-            "temperature": 0.0,
-            "response_format": {"type":"json_object","schema": {"type":"array"}}
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.post("https://openrouter.ai/api/v1/chat/completions",
-                                    json=json_payload, headers=headers) as resp:
-                resp.raise_for_status()
-                result = await resp.json()
-                raw = result["choices"][0]["message"]["content"]
-                try:
-                    data = json.loads(raw)
-                    if isinstance(data, list):
-                        norm = []
-                        for it in data:
-                            name = str(it.get("name","")).strip()
-                            if not name:
-                                continue
-                            qty = float(it.get("quantity", 1) or 1)
-                            price = float(it.get("price", 0) or 0)
-                            norm.append({"name": name, "quantity": qty, "price": price})
-                        return norm
-                except Exception:
-                    pass
-    except Exception:
-        # fall back
-        pass
-    # Heuristic fallback: find fragments like "<word(s)> за <number>"
-    items = []
-    text_l = text.lower().replace(" ", " ")
-    # normalize "10к" -> 10000
-    def parse_amount(tok: str) -> float:
-        tok = tok.replace(" ", "")
-        m = re.match(r"(\d+(?:[.,]\d+)?)(k|к|тыс|тысяч|к?осар[ьяе]|т|тр)?", tok)
-        if not m:
-            return 0.0
-        num = float(m.group(1).replace(",", "."))
-        mul = m.group(2)
-        if mul:
-            return num * 1000.0
-        return num
-    for m in re.finditer(r"([а-яa-z0-9\s\-]+?)\s+за\s+(\d+[.,]?\d*\s*[кk]?)", text_l):
-        name = m.group(1).strip(" ,.-")
-        amt = parse_amount(m.group(2))
-        if name and amt>0:
-            items.append({"name": name, "quantity": 1.0, "price": float(amt)})
+    # Подставляем пользовательский текст в шаблон промпта
+    prompt = TEXT_POSITIONS_PROMPT.format(text=text)
+    from langchain_core.messages import HumanMessage
+    msg = HumanMessage(content=prompt)
+    # Асинхронный вызов модели
+    ai_response = await structured_llm.ainvoke([msg])
+    # parsed.root содержит список Item
+    items: list[Item] = ai_response["parsed"].root
     return items
 
-# Strengthen intent classifier prompt
-INTENT_PROMPT = """
-Classify the user's Russian message into one of intents:
-- "add_position" — they ask to add items/positions to the current receipt (e.g., 'добавь такси за 300', 'ещё кофе за 120', 'пиво 2 по 150').
-- "show_positions" — they want to show/display positions (/show_position, 'покажи позиции').
-- "calculate" — they want to calculate/settle debts ('посчитай', 'кто кому должен', 'итог').
-- "help" — help/about commands.
-- "unknown" — none of the above.
+# ---------------------------------------------------------------------------
+# Новый функционал: разбор позиций из текстовых сообщений
+# ---------------------------------------------------------------------------
+def _extract_items_from_text_regex(text: str) -> list[dict]:
+    """
+    Простая эвристика для извлечения позиций из естественного языка.
 
-Return ONLY the label string.
-"""
+    Принимает строку с описанием покупок (например,
+    "добавь в позиции такси за 300 рублей и пирожок за 2к") и возвращает
+    список словарей с ключами ``name``, ``quantity`` и ``price``.
 
-async def classify_intent_llm(text: str) -> str:
-    try:
-        headers = {
-            "Authorization": f"Bearer {settings.openrouter_api_key}",
-            "Content-Type": "application/json",
-        }
-        json_payload = {
-            "model": settings.openrouter_model or "anthropic/claude-3.5-sonnet",
-            "messages": [
-                {"role":"system","content": INTENT_PROMPT},
-                {"role":"user","content": text},
-            ],
-            "temperature": 0.0,
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.post("https://openrouter.ai/api/v1/chat/completions",
-                                    json=json_payload, headers=headers) as resp:
-                resp.raise_for_status()
-                result = await resp.json()
-                content = result["choices"][0]["message"]["content"].strip().lower()
-                content = re.sub(r"[^a-z_]+", "", content)
-                return content if content in {"add_position","show_positions","calculate","help","unknown"} else "unknown"
-    except Exception:
-        return classify_message_heuristic(text)
+    - ``name`` — название позиции (строка)
+    - ``quantity`` — количество (float), по умолчанию 1
+    - ``price`` — цена (float) за единицу
+
+    Функция использует регулярные выражения для поиска цен и простые
+    эвристики для отделения названия от цены. Она поддерживает числа
+    формата 1, 1.5, 1,5, а также суффикс «к»/«k» для тысяч (например, 5к = 5000).
+
+    Если цена не найдена, позиция игнорируется.
+    """
+    import re
+
+    # приведение строки к нижнему регистру для стабильности поиска
+    lowered = text.lower()
+    # убираем триггерные слова, которые не относятся к названию
+    lowered = re.sub(
+        r"\b(добав(ь|ить)?|хочу|в\s*позици(?:и|ю|ях)?|позицию|позиции|позиций)\b",
+        " ",
+        lowered,
+    )
+    # заменяем распространённые разделители на единый символ '|'
+    # Важно: более длинные фразы ("и ещё", "и еще") заменяем раньше, чем короткое "и",
+    # чтобы не порезать слово «ещё» при замене.
+    for sep in [",", ";", " и ещё ", " и еще ", " и "]:
+        lowered = lowered.replace(sep, "|")
+    parts = []
+    for p in lowered.split("|"):
+        part = p.strip()
+        if not part:
+            continue
+        # убираем оставшееся слово "ещё" или "еще" в начале фрагмента, если оно осталось
+        if part.startswith("ещё") or part.startswith("еще"):
+            # удаляем только само слово, оставляя последующий текст
+            part = part.split(" ", 1)[1].strip() if " " in part else ""
+        if part:
+            parts.append(part)
+    items: list[dict] = []
+    for part in parts:
+        # Находим все числовые токены в части. Каждый токен состоит из числа с возможной
+        # десятичной точкой/запятой и опциональным суффиксом k/к.
+        num_matches = re.findall(r"(\d+[\.,]?\d*)\s*(к|k|к)?", part)
+        if not num_matches:
+            continue
+        # Обрабатываем список чисел: конвертируем в float, учитывая суффикс тысяч
+        numbers: list[float] = []
+        for num_str, suffix in num_matches:
+            try:
+                val = float(num_str.replace(",", "."))
+            except ValueError:
+                continue
+            if suffix:
+                val *= 1000
+            numbers.append(val)
+        if not numbers:
+            continue
+        # Если найдено более одного числа, первое трактуем как количество, второе — как цену.
+        # Иначе, если одно число, количество считаем равным 1, а число — ценой.
+        if len(numbers) >= 2:
+            quantity_val = numbers[0]
+            price_val = numbers[1]
+        else:
+            quantity_val = 1.0
+            price_val = numbers[0]
+        # Очищаем название: удаляем все числовые токены вместе с суффиксами,
+        # а также служебные слова и обозначения. Работаем с копией исходного текста части.
+        name_candidate = part
+        # Удаляем все числа с возможными суффиксами (например "10к", "50", "2.5")
+        name_candidate = re.sub(r"\d+[\.,]?\d*\s*(к|k|к)?", "", name_candidate)
+        # Удаляем указания умножения и единицы (x, ×, шт и др.)
+        name_candidate = re.sub(r"\b(?:x|×|шт|штуки|штук|по|за)\b", "", name_candidate)
+        # Удаляем валюту, но только как самостоятельные слова
+        name_candidate = re.sub(r"\b(?:руб(?:\.|лей)?|р(?:\.)?|₽)\b", "", name_candidate)
+        # Удаляем символы 'x' или '×' оставшиеся после чисел (без границ слова)
+        name_candidate = re.sub(r"[x×]", "", name_candidate)
+        # Сжимаем пробелы
+        name_candidate = re.sub(r"\s+", " ", name_candidate).strip()
+        # Если после очистки название пустое, используем заглушку
+        name_final = name_candidate or "позиция"
+        items.append({
+            "name": name_final,
+            "quantity": quantity_val,
+            "price": price_val
+        })
+    return items

@@ -17,7 +17,7 @@ dp.include_router(nlu_router).
 from aiogram import Router, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
-from services.llm_api import classify_message, classify_intent_llm
+from services.llm_api import classify_message, classify_intent_llm, extract_items_from_text
 # Используем единый модуль базы данных из пакета ``app`` для работы с
 # таблицами. Это предотвращает возникновение нескольких экземпляров
 # ``database.py`` в разных местах проекта и гарантирует, что и бот, и
@@ -29,6 +29,7 @@ from app.database import (
     end_text_session,
     TEXT_SESSIONS,
     get_user,
+    add_positions,
 )
 
 from handlers.receipts import finalize_receipt
@@ -82,6 +83,51 @@ async def handle_nlu_message(msg: Message):
                 f"Привет, {user.get('full_name', 'друг')}! Я — Разделятор. Могу помочь вам разделить покупки.\n"
                 "Добавьте меня в группу, чтобы делить чеки с друзьями."
             )
+        return
+    # Добавление позиций по тексту
+    if intent == "add_position":
+        # Получаем список новых позиций из текста через LLM
+        try:
+            items = await extract_items_from_text(text)
+        except Exception:
+            # Если LLM недоступна или произошла ошибка — сообщаем пользователю
+            await msg.answer(
+                "Не удалось распознать позиции. Попробуйте ещё раз или воспользуйтесь мини‑приложением."
+            )
+            return
+        if not items:
+            await msg.answer(
+                "Не удалось распознать позиции в сообщении. Попробуйте указать название и цену, например: 'такси за 300'."
+            )
+            return
+        # Преобразуем Pydantic Item в обычные dict
+        new_positions = []
+        for item in items:
+            try:
+                # каждая Item имеет атрибуты name, quantity, price
+                new_positions.append({
+                    "name": item.name,
+                    "quantity": item.quantity,
+                    "price": item.price,
+                })
+            except Exception:
+                # fallback: если это уже dict
+                new_positions.append(item)
+        # Сохраняем позиции для текущей группы
+        group_id = str(msg.chat.id)
+        add_positions(group_id, new_positions)
+        # Формируем ответ пользователю
+        lines = []
+        for item in new_positions:
+            name = item.get("name")
+            quantity = item.get("quantity")
+            price = item.get("price")
+            price_str = f"{price:.0f}" if price == int(price) else f"{price:.2f}"
+            qty_str = f"{quantity:.0f}" if quantity == int(quantity) else f"{quantity:.2f}"
+            lines.append(f"{name} — {qty_str} x {price_str}₽")
+        await msg.answer(
+            "Добавлены позиции:\n" + "\n".join(lines)
+        )
         return
 
     if intent == "list_positions":
@@ -169,32 +215,3 @@ async def handle_nlu_message(msg: Message):
     await msg.answer(
         "Извините, я не понимаю. Напишите /help, чтобы узнать, что я умею."
     )
-
-
-from aiogram import Router, F
-from aiogram.filters import Command
-from aiogram.types import Message
-from services.llm_api import classify_intent_llm, extract_items_from_text
-from app.database import add_positions
-from config import settings
-
-nlu_router = Router(name="nlu")
-
-@nlu_router.message(F.text)
-async def handle_nlu_message(msg: Message):
-    text = msg.text or ""
-    # classify intent
-    intent = await classify_intent_llm(text)
-    if intent == "add_position":
-        items = await extract_items_from_text(text)
-        if not items:
-            await msg.answer("Не удалось распарсить позиции из текста.")
-            return
-        group_id = str(msg.chat.id)
-        # default quantity=1 if missing already handled
-        add_positions(group_id, items)
-        # pretty echo
-        lines = [f"• {it['name']} — {it.get('quantity',1)} × {it.get('price',0)}₽" for it in items]
-        await msg.answer("Добавил позиции:\n" + "\n".join(lines))
-        return
-    # other intents fall through to existing logic if present
