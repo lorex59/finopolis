@@ -68,12 +68,15 @@ PROMPT = (
 
 # Prompt template for extracting positions from a free‑form Russian text.
 TEXT_POSITIONS_PROMPT = (
-    "Ты — помощник, который извлекает список покупок из текста, написанного на русском. "
+    "Ты — ассистент по разбору списка покупок в свободном тексте. "
     "Тебе нужно вернуть строго JSON‑массив объектов с полями name (строка), quantity (число) и price (число). "
-    "Если количество не указано — считать его равным 1. "
+    "Если количество не указано — считай его равным 1. Цена может быть указана как просто число, число с суффиксом 'к' или 'k' (обозначающим тысячи), "
+    "или сопровождаться словами 'руб', 'руб.', 'рублей', 'р', '₽'. Количество может находиться перед или после названия: '2 яблока по 50', 'яблока x2 50'. "
+    "Если количество указано с помощью 'x' или '×', трактуй его как количество. Разделители между позициями могут быть запятая, точка, слово 'и', 'и ещё' и подобные. "
+    "Пример: 'Добавь такси 300 рублей' → [{\"name\": \"такси\", \"quantity\": 1, \"price\": 300}]. "
+    "Пример: 'дом 10к' → [{\"name\": \"дом\", \"quantity\": 1, \"price\": 10000}]. "
+    "Пример: 'хлеб x2 30 руб' → [{\"name\": \"хлеб\", \"quantity\": 2, \"price\": 30}]. "
     "Не добавляй никаких пояснений, только JSON‑массив. "
-    "Пример: пользователь пишет: «Добавь в позиции такси за 300 рублей и дом за 10к». "
-    "Ты возвращаешь: [{\"name\": \"такси\", \"quantity\": 1, \"price\": 300}, {\"name\": \"дом\", \"quantity\": 1, \"price\": 10000}]. "
     "Текст: {text}"
 )
 
@@ -297,6 +300,22 @@ async def extract_items_from_text(text: str) -> list[Item]:
     ai_response = await structured_llm.ainvoke([msg])
     # parsed.root содержит список Item
     items: list[Item] = ai_response["parsed"].root
+    # Если модель вернула пустой список, попробуем fallback с простым парсером
+    print("LLM response items:", items)
+    if not items:
+        try:
+            fallback = _extract_items_from_text_regex(text)
+            # Конвертируем fallback-словарь в Item-модели
+            result: list[Item] = []
+            for d in fallback:
+                try:
+                    result.append(Item(name=d["name"], quantity=float(d.get("quantity", 1)), price=float(d.get("price", 0))))
+                except Exception:
+                    continue
+            if result:
+                return result
+        except Exception:
+            pass
     return items
 
 # ---------------------------------------------------------------------------
