@@ -367,18 +367,50 @@ async def handle_web_app_data(msg: Message):
 
 @router.message(Command("show"))
 async def show_positions(msg: Message):
-    # Показываем позиции только для текущей группы
+    # Показываем позиции только для текущей группы и отображаем, кто какие позиции выбрал.
     group_id = str(msg.chat.id)
-    positions = get_positions(group_id)
+    positions = get_positions(group_id) or []
     if not positions:
         await msg.answer("Нет позиций! Сначала добавьте чеки.")
         return
-    text = "\n".join([
-        f"{idx+1}. {i['name']} — {i['quantity']} x {i['price']}₽"
-        for idx, i in enumerate(positions)
-    ])
+    # Загружаем выбранные позиции, чтобы показать, кто что выбрал
+    from app.database import get_selected_positions as _get_selected_positions
+    selections = _get_selected_positions(group_id) or {}
+    # Сгруппируем выбранные позиции по ключу (name, price) → список (user_name, quantity)
+    selection_map: dict[tuple[str, float], list[tuple[str, float]]] = {}
+    for uid, pos_list in selections.items():
+        # Получаем имя пользователя для отображения
+        user_info = get_user(uid) or {}
+        user_name = user_info.get('full_name') or user_info.get('phone') or str(uid)
+        for pos in pos_list:
+            try:
+                key = (pos.get('name'), float(pos.get('price', 0)))
+                qty_raw = pos.get('quantity')
+                qty = float(qty_raw) if qty_raw is not None else 0.0
+            except Exception:
+                continue
+            selection_map.setdefault(key, []).append((user_name, qty))
+    # Формируем текст для вывода
+    lines: list[str] = []
+    for idx, item in enumerate(positions):
+        name = item.get('name')
+        qty = item.get('quantity')
+        price = item.get('price')
+        lines.append(f"{idx+1}. {name} — {qty} × {price}₽")
+        key = (name, float(price) if price is not None else 0.0)
+        participants = selection_map.get(key)
+        if participants:
+            parts = []
+            for uname, q in participants:
+                # Округляем количество до двух знаков
+                try:
+                    q_disp = round(float(q), 2)
+                except Exception:
+                    q_disp = q
+                parts.append(f"{uname} × {q_disp}")
+            lines.append("<i>Выбрали: " + "; ".join(parts) + "</i>")
     kb = positions_keyboard(positions)
-    await msg.answer(f"<b>Все позиции:</b>\n{text}", parse_mode="HTML", reply_markup=kb)
+    await msg.answer("<b>Все позиции:</b>\n" + "\n".join(lines), parse_mode="HTML", reply_markup=kb)
 
 @router.callback_query(F.data.startswith("del_"))
 async def delete_position(call: CallbackQuery):
@@ -481,196 +513,98 @@ async def save_new_position(msg: Message, state: FSMContext):
 @router.message(Command("finalize"))
 async def finalize_receipt(msg: Message):
     """
-    Финальный расчёт для текущего чека.
+    Выполняет финальный клиринг по текущему чеку.
 
-    Есть два режима:
-      - Если участники распределили позиции через мини‑приложение, то расходы
-        рассчитываются на основе выбранных позиций (ASSIGNMENTS).
-      - Если был активирован текстовый сценарий, то используются
-        накопленные сообщения и LLM для распределения.
-      - Если ни одно из условий не выполнено, делим сумму поровну как раньше.
+    В новой версии расчёт основан только на выбранных вручную позициях и
+    внесённых платежах. Распределение поровну и текстовый сценарий
+    (через LLM) не используются. Итогом работы является список
+    оптимальных переводов между участниками, который отправляется
+    каждому пользователю в личные сообщения. В группу отправляется
+    сводка переводов. Также сохраняется информация о долгах в таблицу
+    debts и журнал платежей.
     """
     group_id = str(msg.chat.id)
     receipt_id = group_id
-    positions = get_positions(group_id)
+    # Проверяем, что есть позиции для расчёта
+    positions = get_positions(group_id) or []
     if not positions:
         await msg.answer("Нет позиций для расчёта. Сначала отправьте чек.")
         return
-    users = list(get_all_users())
-    if not users:
-        await msg.answer("Нет зарегистрированных пользователей для расчёта.")
+    # Загружаем распределённые позиции и платежи
+    from app.database import get_selected_positions as _get_selected_positions, get_payments
+    selections = _get_selected_positions(group_id) or {}
+    payments = get_payments(group_id) or {}
+    # Если нет ни выбранных позиций, ни платежей, расчёт невозможен
+    if not selections and not payments:
+        await msg.answer("Нет данных для расчёта. Сначала распределите позиции или укажите платежи командой /pay.")
         return
-
-    # 1. Попробуем использовать текстовый сценарий, если он завершён
-    # Импортируем TEXT_SESSIONS из общего модуля базы данных. Это
-    # используется для хранения состояния текстовых сессий и должен
-    # ссылаться на единственный экземпляр структуры в ``app.database``.
-    from app.database import TEXT_SESSIONS
-    session = TEXT_SESSIONS.get(receipt_id)
-    if session and not session.get("collecting") and session.get("messages"):
-        # items for LLM: convert positions to dict{name: price}
-        items_for_llm: dict[str, float] = {}
-        for item in positions:
-            try:
-                total_price = float(item.get("price", 0)) * float(item.get("quantity", 1))
-                items_for_llm[item.get("name")] = total_price
-            except Exception:
-                pass
-        messages = session["messages"]
+    # Вычисляем оптимальные переводы на основе клиринга
+    transfers = calculate_group_balance(group_id) or []
+    # Подготовим отображение долгов для сохранения: должник → сумма
+    debt_mapping: dict[int, float] = {}
+    for debtor_id, creditor_id, amount in transfers:
+        # Суммируем долг должника по всем переводам
+        debt_mapping[debtor_id] = round(debt_mapping.get(debtor_id, 0.0) + float(amount), 2)
+    # Сохраняем долги и логируем платёж (используем фиктивный ID транзакции)
+    save_debts(receipt_id, debt_mapping)
+    # Записываем в журнал. Используем фиктивный идентификатор, так как реального
+    # массового платежа здесь не выполняется.
+    fake_tx_id = "manual_clear"
+    log_payment(receipt_id, fake_tx_id, debt_mapping)
+    # Ссылка на группу для удобства пользователей. Для супергрупп Telegram использует
+    # идентификаторы вида -100.... Чтобы построить ссылку, убираем префикс -100.
+    group_link = ""
+    try:
+        chat_id_str = str(msg.chat.id)
+        if chat_id_str.startswith("-100"):
+            group_link = f"https://t.me/c/{chat_id_str[4:]}"
+    except Exception:
+        group_link = ""
+    # Строим персональные сообщения для каждого участника. Собираем входящие и исходящие
+    # переводы, чтобы пользователь видел, кому он должен и кто должен ему.
+    user_transfers: dict[int, dict[str, list[tuple[int, float]]]] = {}
+    for debtor_id, creditor_id, amount in transfers:
+        user_transfers.setdefault(debtor_id, {"out": [], "in": []})
+        user_transfers.setdefault(creditor_id, {"out": [], "in": []})
+        user_transfers[debtor_id]["out"].append((creditor_id, float(amount)))
+        user_transfers[creditor_id]["in"].append((debtor_id, float(amount)))
+    # Отправляем каждому пользователю личное сообщение
+    for uid, flows in user_transfers.items():
+        messages: list[str] = []
+        outgoing = flows.get("out", [])
+        incoming = flows.get("in", [])
+        for creditor_id, amount in outgoing:
+            creditor_info = get_user(creditor_id) or {}
+            creditor_name = creditor_info.get('full_name') or creditor_info.get('phone') or str(creditor_id)
+            messages.append(f"Вы должны {amount}₽ пользователю {creditor_name}.")
+        for debtor_id, amount in incoming:
+            debtor_info = get_user(debtor_id) or {}
+            debtor_name = debtor_info.get('full_name') or debtor_info.get('phone') or str(debtor_id)
+            messages.append(f"{debtor_name} должен вам {amount}₽.")
+        if not messages:
+            messages.append("Ваш баланс нулевой. Нет обязательств.")
+        if group_link:
+            messages.append(f"Группа: {group_link}")
         try:
-            debt_mapping = await calculate_debts_from_messages(items_for_llm, messages)
-        except Exception as e:
-            await msg.answer(f"Ошибка при расчёте через LLM: {e}\nПробуем поровну разделить.")
-            debt_mapping = None
-        if isinstance(debt_mapping, dict):
-            # Округлить и привести ключи к int
-            mapping: dict[int, float] = {}
-            for k, v in debt_mapping.items():
-                try:
-                    mapping[int(k)] = round(float(v), 2)
-                except Exception:
-                    pass
-            if mapping:
-                # Выполняем платёж и логируем его
-                tx_id = await mass_pay(mapping)
-                save_debts(receipt_id, mapping)
-                log_payment(receipt_id, tx_id, mapping)
-                set_positions(group_id, [])
-                # Очистим текстовую сессию
-                session["messages"] = []
-                # Отправляем каждому пользователю личное уведомление с их суммой
-                for user_id, amount in mapping.items():
-                    try:
-                        # Покажем имя, если доступно
-                        user_info = get_user(user_id) or {}
-                        name = user_info.get('full_name') or user_info.get('phone') or str(user_id)
-                        await msg.bot.send_message(user_id, f"{name}, вы должны {amount}₽. Спасибо за участие!")
-                    except Exception:
-                        pass
-                # Формируем текст для группового чата
-                text_lines = ["💰 Расчёт завершён!", f"ID транзакции: {tx_id}"]
-                text_lines.append("\nСуммы к оплате:")
-                for user_id, amount in mapping.items():
-                    user_info = get_user(user_id) or {}
-                    name = user_info.get('full_name') or user_info.get('phone') or str(user_id)
-                    text_lines.append(f"{name} ({user_id}) → {amount}₽")
-                await msg.answer("\n".join(text_lines), parse_mode="HTML")
-                return
-
-    # 2. Если у нас есть назначения из WebApp
-    assignments = get_assignments(receipt_id)
-    if assignments:
-        """
-        Для мини‑приложения используется таблица selected_positions, в которой
-        хранится фактическое количество и цена каждой выбранной позиции. Это
-        позволяет корректно учитывать дробные количества (например, 1.5) и
-        избегать ошибок, связанных с округлением количества до целого числа.
-
-        Если в базе для данной группы присутствуют записи selected_positions,
-        то расчёт производится на их основе: для каждого пользователя
-        суммируется количество * цена по всем выбранным позициям. В противном
-        случае выполняется fallback к расчёту по assignments, где индексы
-        повторяются согласно выбранному количеству (как в предыдущих
-        версиях).
-        """
-        from app.database import get_selected_positions as _get_selected_positions
-        # Попробуем получить детальное распределение
-        selections = _get_selected_positions(group_id)
-        mapping: dict[int, float] = {}
-        if selections:
-            # Суммируем стоимость для каждого пользователя
-            for uid, pos_list in selections.items():
-                total = 0.0
-                for pos in pos_list:
-                    try:
-                        qty = float(pos.get("quantity", 0))
-                        price = float(pos.get("price", 0))
-                        total += qty * price
-                    except Exception:
-                        pass
-                mapping[uid] = round(total, 2)
-        else:
-            # Фолбэк: используем assignments (целочисленное количество)
-            cost_per_position: list[float] = []
-            for item in positions:
-                try:
-                    cost_per_position.append(float(item.get("price", 0)))
-                except Exception:
-                    cost_per_position.append(0.0)
-            # Инициализируем нулевыми
-            mapping = {user_id: 0.0 for user_id, _ in users}
-            for user_id, indices in assignments.items():
-                total = 0.0
-                for idx in indices:
-                    if 0 <= idx < len(cost_per_position):
-                        total += cost_per_position[idx]
-                mapping[user_id] = round(total, 2)
-        # Определяем плательщика (тот, кто вызвал /finalize)
-        payer_id = msg.from_user.id
-        debt_mapping: dict[int, float] = {}
-        for uid, amount in mapping.items():
-            # Пропускаем плательщика: он ничего не должен самому себе
-            if uid == payer_id:
-                continue
-            debt_mapping[uid] = amount
-        # Выполняем перевод и логируем
-        tx_id = await mass_pay(debt_mapping)
-        # Сохраняем рассчитанные долги в базу
-        save_debts(receipt_id, debt_mapping)
-        log_payment(receipt_id, tx_id, debt_mapping)
-        # Очищаем позиции, чтобы следующий расчёт был независим
-        set_positions(group_id, [])
-        # Уведомляем каждого должника персонально
-        for uid, amount in debt_mapping.items():
-            try:
-                user_info = get_user(uid) or {}
-                name = user_info.get('full_name') or user_info.get('phone') or str(uid)
-                payer_info = get_user(payer_id) or {}
-                payer_name = payer_info.get('full_name') or payer_info.get('phone') or str(payer_id)
-                await msg.bot.send_message(uid, f"{name}, вы должны {amount}₽ пользователю {payer_name}.")
-            except Exception:
-                pass
-        # Подготовим текст для группового чата
-        text_lines = ["💰 Расчёт завершён!", f"ID транзакции: {tx_id}"]
-        text_lines.append("\nСуммы к оплате:")
-        for uid, amount in debt_mapping.items():
-            user_info = get_user(uid) or {}
-            name = user_info.get('full_name') or user_info.get('phone') or str(uid)
-            text_lines.append(f"{name} ({uid}) → {amount}₽")
-        await msg.answer("\n".join(text_lines), parse_mode="HTML")
-        return
-
-    # 3. По умолчанию делим сумму поровну между всеми участниками
-    total_cost = 0.0
-    for item in positions:
-        try:
-            total_cost += float(item.get("price", 0)) * float(item.get("quantity", 1))
+            await msg.bot.send_message(uid, "\n".join(messages))
         except Exception:
             pass
-    count = len(users)
-    share = total_cost / count if count else 0.0
-    mapping = {user_id: round(share, 2) for user_id, _ in users}
-    # Выполняем платёж и логируем его
-    tx_id = await mass_pay(mapping)
-    save_debts(receipt_id, mapping)
-    log_payment(receipt_id, tx_id, mapping)
+    # Формируем сводку для группового чата
+    summary_lines: list[str] = ["💰 Клиринг завершён!"]
+    if transfers:
+        summary_lines.append("\n<b>Оптимальные переводы:</b>")
+        for debtor_id, creditor_id, amount in transfers:
+            debtor_info = get_user(debtor_id) or {}
+            creditor_info = get_user(creditor_id) or {}
+            debtor_name = debtor_info.get('full_name') or debtor_info.get('phone') or str(debtor_id)
+            creditor_name = creditor_info.get('full_name') or creditor_info.get('phone') or str(creditor_id)
+            summary_lines.append(f"{debtor_name} → {creditor_name}: {amount}₽")
+        summary_lines.append("\nПодробности отправлены каждому участнику в личные сообщения.")
+    else:
+        summary_lines.append("\nВсе расчёты закрыты. Нет обязательств между участниками.")
+    await msg.answer("\n".join(summary_lines), parse_mode="HTML")
+    # Очищаем позиции, чтобы следующий расчёт был независим
     set_positions(group_id, [])
-    # Уведомления в личку: каждый получает уведомление о сумме, которую должен
-    for uid, amount in mapping.items():
-        try:
-            user_info = get_user(uid) or {}
-            name = user_info.get('full_name') or user_info.get('phone') or str(uid)
-            await msg.bot.send_message(uid, f"{name}, вы должны {amount}₽ (поровну разделено).")
-        except Exception:
-            pass
-    # Групповое сообщение с именами
-    text_lines = ["💰 Расчёт завершён!", f"ID транзакции: {tx_id}"]
-    text_lines.append("\nСуммы к оплате:")
-    for user_id, amount in mapping.items():
-        user_info = get_user(user_id) or {}
-        name = user_info.get('full_name') or user_info.get('phone') or str(user_id)
-        text_lines.append(f"{name} ({user_id}) → {amount}₽")
-    await msg.answer("\n".join(text_lines), parse_mode="HTML")
 
 
 # ---------------------------------------------------------------------------

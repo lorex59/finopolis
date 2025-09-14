@@ -348,11 +348,17 @@ def save_selected_positions(group_id: str, user_id: int, positions: list[dict]) 
     # Сохраняем в базу данных
     conn = get_db_connection()
     cur = conn.cursor()
-    # Удаляем прежний выбор этого пользователя в группе
-    cur.execute(
-        "DELETE FROM selected_positions WHERE group_id = ? AND user_tg_id = ?",
-        (str(group_id), str(user_id)),
-    )
+    # Прежний выбор этого пользователя в группе больше не удаляется.
+    # Ранее реализация полностью очищала выбор пользователя перед
+    # сохранением новых позиций. Это приводило к тому, что при
+    # повторном выборе позиции предыдущее значение затиралось. В рамках
+    # исправления поведения мы не удаляем существующие записи, чтобы
+    # новые выбранные позиции добавлялись к уже сохранённым. Оставляем
+    # код удаления закомментированным для наглядности.
+    # cur.execute(
+    #     "DELETE FROM selected_positions WHERE group_id = ? AND user_tg_id = ?",
+    #     (str(group_id), str(user_id)),
+    # )
     if positions:
         for pos in positions:
             name = pos.get('name')

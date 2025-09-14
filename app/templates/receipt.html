@@ -275,6 +275,29 @@
           controls.appendChild(minusBtn);
           controls.appendChild(input);
           controls.appendChild(plusBtn);
+          // Кнопка для выбора позиции поровну. При нажатии устанавливает
+          // количество равным 1, что обозначает участие в равном делении.
+          const splitBtn = document.createElement('button');
+          splitBtn.type = 'button';
+          splitBtn.textContent = 'Поровну';
+          splitBtn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            // Если пользователь уже выбрал некоторое количество, сбрасываем до 0,
+            // иначе устанавливаем 1 (одна доля). Такой подход позволяет
+            // переключать режим выбора.
+            let val = parseFloat(input.value) || 0;
+            if (val > 0) {
+              val = 0;
+            } else {
+              val = 1;
+            }
+            // Округляем до двух знаков
+            val = Math.round(val * 100) / 100;
+            input.value = String(val);
+            updateSelection(val);
+            updateSummary(selectedQuantities, positions, summaryEl);
+          });
+          controls.appendChild(splitBtn);
           el.appendChild(controls);
           listEl.appendChild(el);
         });
