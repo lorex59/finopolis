@@ -9,14 +9,16 @@
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
         padding: 20px;
         margin: 0;
-        background-color: #f9f9fb;
+        /* Добавляем лёгкий градиент для создания более приятного фона */
+        background: linear-gradient(180deg, #f9f9fb 0%, #f3f5fa 100%);
         color: #202020;
       }
       h1 {
-        font-size: 22px;
-        margin-bottom: 16px;
+        font-size: 24px;
+        margin-bottom: 20px;
         text-align: center;
         font-weight: 600;
+        color: #0b5394;
       }
       /* Контейнер для списка позиций */
       #list {
@@ -28,18 +30,18 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 12px 14px;
+        padding: 14px 16px;
         background-color: #ffffff;
-        border-radius: 8px;
-        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+        border-radius: 12px;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
         transition: background-color 0.2s ease, box-shadow 0.2s ease;
         cursor: pointer;
       }
       .item:hover {
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        box-shadow: 0 3px 6px rgba(0, 0, 0, 0.08);
       }
       .item.selected {
-        background-color: #e6f4ff;
+        background-color: #eaf5ff;
       }
       .item span {
         font-size: 16px;
@@ -47,42 +49,72 @@
       .controls {
         display: flex;
         align-items: center;
-        gap: 4px;
+        gap: 6px;
       }
       .controls input[type=number] {
-        width: 50px;
+        width: 55px;
         padding: 4px;
         font-size: 14px;
+        border: 1px solid #d6e0ef;
+        border-radius: 6px;
+        background-color: #f8fafd;
       }
       .controls button {
-        width: 28px;
-        height: 28px;
-        font-size: 16px;
+        width: 34px;
+        height: 34px;
+        font-size: 18px;
         line-height: 1;
         padding: 0;
-        border: 1px solid #ccc;
-        background-color: #f0f0f0;
+        border: 1px solid #d6e0ef;
+        background-color: #f1f6fc;
         cursor: pointer;
-        border-radius: 4px;
+        border-radius: 6px;
+        transition: background-color 0.2s ease, box-shadow 0.2s ease;
       }
       .controls button:hover {
-        background-color: #e0e0e0;
+        background-color: #e4eef9;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+      }
+      /* Стили для кнопки «Поровну» */
+      .equal-btn {
+        flex-shrink: 0;
+        padding: 0 10px;
+        height: 34px;
+        font-size: 14px;
+        background-color: #fff2d6;
+        color: #c27016;
+        border: 1px solid #f3cda7;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: background-color 0.2s ease, box-shadow 0.2s ease;
+      }
+      .equal-btn.active {
+        background-color: #ffe7bf;
+        color: #a25a0e;
+        border-color: #eac297;
+      }
+      .equal-btn:hover {
+        background-color: #fce0b0;
+      }
+      .item.equal-share {
+        background-color: #fff8e6;
       }
       button {
-        margin-top: 20px;
+        margin-top: 24px;
         width: 100%;
-        padding: 12px 0;
+        padding: 14px 0;
         font-size: 16px;
         font-weight: 500;
-        background-color: #2ea44f;
+        background-color: #2f80ed;
         color: #fff;
         border: none;
-        border-radius: 8px;
+        border-radius: 10px;
         cursor: pointer;
-        transition: background-color 0.2s ease;
+        transition: background-color 0.2s ease, box-shadow 0.2s ease;
       }
       button:hover {
-        background-color: #24963f;
+        background-color: #1366d6;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
       }
     </style>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
@@ -167,9 +199,28 @@
             count += qtySelected;
           }
         });
-        summaryEl.textContent = count === 0
-          ? 'Ничего не выбрано'
-          : `Выбрано ${count} ${count === 1 ? 'позиция' : (count < 5 ? 'позиции' : 'позиций')} на сумму ${total.toFixed(2)}₽`;
+        // Количество позиций, отмеченных как «поровну» (equalSelections хранится в глобальной области)
+        let equalCount = 0;
+        try {
+          if (window.equalSelections) {
+            equalCount = Object.keys(window.equalSelections).length;
+          }
+        } catch (e) {
+          equalCount = 0;
+        }
+        if (count === 0 && equalCount === 0) {
+          summaryEl.textContent = 'Ничего не выбрано';
+          return;
+        }
+        // Формируем строку с количеством выбранных позиций
+        const countStr = count > 0 ? `${count} ${count === 1 ? 'позиция' : (count < 5 ? 'позиции' : 'позиций')}` : '';
+        const totalStr = count > 0 ? `на сумму ${total.toFixed(2)}₽` : '';
+        const equalStr = equalCount > 0 ? `${equalCount} ${equalCount === 1 ? 'позиция' : (equalCount < 5 ? 'позиции' : 'позиций')} поровну` : '';
+        // Соединяем части. Используем запятую, если присутствуют несколько частей.
+        const parts = [];
+        if (countStr) parts.push(countStr + (totalStr ? ' ' + totalStr : ''));
+        if (equalStr) parts.push(equalStr);
+        summaryEl.textContent = 'Выбрано ' + parts.join(', ');
       }
 
       // Асинхронная инициализация.
@@ -178,6 +229,12 @@
         const listEl = document.getElementById('list');
         const summaryEl = document.getElementById('summary');
         const selectedQuantities = {};
+        // Храним позиции, отмеченные как «поровну». Ключ — индекс позиции,
+        // значение true. Эти позиции будут переданы в бэкэнд с
+        // отрицательным количеством.
+        const equalSelections = {};
+        // Делаем equalSelections доступным глобально, чтобы updateSummary мог получить количество
+        window.equalSelections = equalSelections;
         // Заполняем список позиций
         positions.forEach((item, idx) => {
           const el = document.createElement('div');
@@ -214,6 +271,11 @@
           const plusBtn = document.createElement('button');
           plusBtn.type = 'button';
           plusBtn.textContent = '+';
+          // Кнопка «Поровну»
+          const equalBtn = document.createElement('button');
+          equalBtn.type = 'button';
+          equalBtn.textContent = 'Поровну';
+          equalBtn.className = 'equal-btn';
           function updateSelection(val) {
             if (val > 0) {
               selectedQuantities[idx] = val;
@@ -225,6 +287,8 @@
           }
           minusBtn.addEventListener('click', (ev) => {
             ev.stopPropagation();
+            // если выбрана поровну, не изменяем количество
+            if (equalSelections[idx]) return;
             let val = parseFloat(input.value) || 0;
             if (val > 0) {
               val = val - 1;
@@ -238,6 +302,7 @@
           });
           plusBtn.addEventListener('click', (ev) => {
             ev.stopPropagation();
+            if (equalSelections[idx]) return;
             let val = parseFloat(input.value) || 0;
             if (val < maxQty) {
               val = val + 1;
@@ -249,6 +314,7 @@
             }
           });
           input.addEventListener('input', () => {
+            if (equalSelections[idx]) return;
             let val = parseFloat(input.value) || 0;
             if (val < 0) val = 0;
             if (val > maxQty) val = maxQty;
@@ -262,6 +328,8 @@
             if (ev.target === minusBtn || ev.target === plusBtn || ev.target === input) {
               return;
             }
+            // Если выбрана поровну, не изменяем количество по клику
+            if (equalSelections[idx]) return;
             let val = parseFloat(input.value) || 0;
             if (val < maxQty) {
               val = val + 1;
@@ -275,31 +343,41 @@
           controls.appendChild(minusBtn);
           controls.appendChild(input);
           controls.appendChild(plusBtn);
-          // Кнопка для выбора позиции поровну. При нажатии устанавливает
-          // количество равным 1, что обозначает участие в равном делении.
-          const splitBtn = document.createElement('button');
-          splitBtn.type = 'button';
-          splitBtn.textContent = 'Поровну';
-          splitBtn.addEventListener('click', (ev) => {
-            ev.stopPropagation();
-            // Если пользователь уже выбрал некоторое количество, сбрасываем до 0,
-            // иначе устанавливаем 1 (одна доля). Такой подход позволяет
-            // переключать режим выбора.
-            let val = parseFloat(input.value) || 0;
-            if (val > 0) {
-              val = 0;
-            } else {
-              val = 1;
-            }
-            // Округляем до двух знаков
-            val = Math.round(val * 100) / 100;
-            input.value = String(val);
-            updateSelection(val);
-            updateSummary(selectedQuantities, positions, summaryEl);
-          });
-          controls.appendChild(splitBtn);
+          controls.appendChild(equalBtn);
           el.appendChild(controls);
           listEl.appendChild(el);
+
+          // Обработчик нажатия на кнопку «Поровну»
+          equalBtn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            if (equalSelections[idx]) {
+              // Отменяем отметку «поровну»
+              delete equalSelections[idx];
+              equalBtn.classList.remove('active');
+              el.classList.remove('equal-share');
+              // Включаем поле ввода и кнопки
+              input.disabled = false;
+              minusBtn.disabled = false;
+              plusBtn.disabled = false;
+              // Сбрасываем выбранное количество, если оно было скрыто
+              input.value = '0';
+              delete selectedQuantities[idx];
+              updateSummary(selectedQuantities, positions, summaryEl);
+            } else {
+              // Ставим отметку «поровну»
+              equalSelections[idx] = true;
+              equalBtn.classList.add('active');
+              el.classList.add('equal-share');
+              // Отключаем ручное изменение количества
+              input.disabled = true;
+              minusBtn.disabled = true;
+              plusBtn.disabled = true;
+              // Сбрасываем ручной выбор, если был
+              input.value = '0';
+              delete selectedQuantities[idx];
+              updateSummary(selectedQuantities, positions, summaryEl);
+            }
+          });
         });
         // Инициализируем отображение
         updateSummary(selectedQuantities, positions, summaryEl);
@@ -313,11 +391,16 @@
               payload[idx] = qty;
             }
           });
+          // Формируем список индексов для деления поровну
+          const equalList = Object.keys(equalSelections).map((k) => parseInt(k));
           const groupId = extractGroupId();
           const userId = (tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) || null;
           // Подготовим данные для отправки
           // Базовые данные, которые отправим: выбор и group_id
           const data = { selected: payload };
+          if (equalList.length > 0) {
+            data.equal = equalList;
+          }
           if (groupId) {
             data.group_id = groupId;
           }

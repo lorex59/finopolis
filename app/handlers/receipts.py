@@ -42,6 +42,8 @@ from app.database import (
     get_payments,
     calculate_group_balance,
     get_unassigned_positions,
+    init_assignments,
+    TEXT_SESSIONS,
 )
 from services.payments import mass_pay
 from services.llm_api import calculate_debts_from_messages
@@ -367,7 +369,14 @@ async def handle_web_app_data(msg: Message):
 
 @router.message(Command("show"))
 async def show_positions(msg: Message):
-    # Показываем позиции только для текущей группы и отображаем, кто какие позиции выбрал.
+    """
+    Показывает список позиций и отображает, кто какие позиции выбрал.
+
+    Для каждой позиции отображается её название, количество и цена. Под
+    каждой позицией выводится список участников, выбравших её, с
+    указанием количества. Если никто не выбрал позицию, строка
+    «Выбрали…» опускается.
+    """
     group_id = str(msg.chat.id)
     positions = get_positions(group_id) or []
     if not positions:
@@ -379,7 +388,6 @@ async def show_positions(msg: Message):
     # Сгруппируем выбранные позиции по ключу (name, price) → список (user_name, quantity)
     selection_map: dict[tuple[str, float], list[tuple[str, float]]] = {}
     for uid, pos_list in selections.items():
-        # Получаем имя пользователя для отображения
         user_info = get_user(uid) or {}
         user_name = user_info.get('full_name') or user_info.get('phone') or str(uid)
         for pos in pos_list:
@@ -389,7 +397,15 @@ async def show_positions(msg: Message):
                 qty = float(qty_raw) if qty_raw is not None else 0.0
             except Exception:
                 continue
-            selection_map.setdefault(key, []).append((user_name, qty))
+            # Не отображаем количество для отметок «поровну» (отрицательные значения)
+            if qty < 0:
+                q_display = 'поровну'
+            else:
+                try:
+                    q_display = round(qty, 2)
+                except Exception:
+                    q_display = qty
+            selection_map.setdefault(key, []).append((user_name, q_display))
     # Формируем текст для вывода
     lines: list[str] = []
     for idx, item in enumerate(positions):
@@ -400,14 +416,9 @@ async def show_positions(msg: Message):
         key = (name, float(price) if price is not None else 0.0)
         participants = selection_map.get(key)
         if participants:
-            parts = []
+            parts: list[str] = []
             for uname, q in participants:
-                # Округляем количество до двух знаков
-                try:
-                    q_disp = round(float(q), 2)
-                except Exception:
-                    q_disp = q
-                parts.append(f"{uname} × {q_disp}")
+                parts.append(f"{uname} × {q}")
             lines.append("<i>Выбрали: " + "; ".join(parts) + "</i>")
     kb = positions_keyboard(positions)
     await msg.answer("<b>Все позиции:</b>\n" + "\n".join(lines), parse_mode="HTML", reply_markup=kb)
@@ -521,7 +532,9 @@ async def finalize_receipt(msg: Message):
     оптимальных переводов между участниками, который отправляется
     каждому пользователю в личные сообщения. В группу отправляется
     сводка переводов. Также сохраняется информация о долгах в таблицу
-    debts и журнал платежей.
+    debts и журнал платежей. После завершения расчёта данные чеков,
+    выборов и платежей переносятся в архив и удаляются из рабочих
+    таблиц.
     """
     group_id = str(msg.chat.id)
     receipt_id = group_id
@@ -531,7 +544,7 @@ async def finalize_receipt(msg: Message):
         await msg.answer("Нет позиций для расчёта. Сначала отправьте чек.")
         return
     # Загружаем распределённые позиции и платежи
-    from app.database import get_selected_positions as _get_selected_positions, get_payments
+    from app.database import get_selected_positions as _get_selected_positions, get_payments, archive_group_data, clear_group_data
     selections = _get_selected_positions(group_id) or {}
     payments = get_payments(group_id) or {}
     # Если нет ни выбранных позиций, ни платежей, расчёт невозможен
@@ -543,12 +556,9 @@ async def finalize_receipt(msg: Message):
     # Подготовим отображение долгов для сохранения: должник → сумма
     debt_mapping: dict[int, float] = {}
     for debtor_id, creditor_id, amount in transfers:
-        # Суммируем долг должника по всем переводам
         debt_mapping[debtor_id] = round(debt_mapping.get(debtor_id, 0.0) + float(amount), 2)
     # Сохраняем долги и логируем платёж (используем фиктивный ID транзакции)
     save_debts(receipt_id, debt_mapping)
-    # Записываем в журнал. Используем фиктивный идентификатор, так как реального
-    # массового платежа здесь не выполняется.
     fake_tx_id = "manual_clear"
     log_payment(receipt_id, fake_tx_id, debt_mapping)
     # Ссылка на группу для удобства пользователей. Для супергрупп Telegram использует
@@ -568,16 +578,21 @@ async def finalize_receipt(msg: Message):
         user_transfers.setdefault(creditor_id, {"out": [], "in": []})
         user_transfers[debtor_id]["out"].append((creditor_id, float(amount)))
         user_transfers[creditor_id]["in"].append((debtor_id, float(amount)))
-    # Отправляем каждому пользователю личное сообщение
-    for uid, flows in user_transfers.items():
+    # Определяем полный список участников: те, кто выбрал позиции или внёс платежи.
+    all_user_ids: set[int] = set(selections.keys()) | set(payments.keys())
+    # Отправляем каждому пользователю личное сообщение. Если пользователь не участвовал
+    # в переводах (у него нулевой баланс), всё равно уведомим его об отсутствии
+    # обязательств.
+    for uid in all_user_ids:
+        flows = user_transfers.get(uid, {"out": [], "in": []})
         messages: list[str] = []
-        outgoing = flows.get("out", [])
-        incoming = flows.get("in", [])
-        for creditor_id, amount in outgoing:
+        # Исходящие переводы (должен)
+        for creditor_id, amount in flows.get("out", []):
             creditor_info = get_user(creditor_id) or {}
             creditor_name = creditor_info.get('full_name') or creditor_info.get('phone') or str(creditor_id)
             messages.append(f"Вы должны {amount}₽ пользователю {creditor_name}.")
-        for debtor_id, amount in incoming:
+        # Входящие переводы (вам должны)
+        for debtor_id, amount in flows.get("in", []):
             debtor_info = get_user(debtor_id) or {}
             debtor_name = debtor_info.get('full_name') or debtor_info.get('phone') or str(debtor_id)
             messages.append(f"{debtor_name} должен вам {amount}₽.")
@@ -588,6 +603,7 @@ async def finalize_receipt(msg: Message):
         try:
             await msg.bot.send_message(uid, "\n".join(messages))
         except Exception:
+            # Игнорируем ошибку отправки (например, если пользователь запретил ЛС)
             pass
     # Формируем сводку для группового чата
     summary_lines: list[str] = ["💰 Клиринг завершён!"]
@@ -603,8 +619,34 @@ async def finalize_receipt(msg: Message):
     else:
         summary_lines.append("\nВсе расчёты закрыты. Нет обязательств между участниками.")
     await msg.answer("\n".join(summary_lines), parse_mode="HTML")
-    # Очищаем позиции, чтобы следующий расчёт был независим
-    set_positions(group_id, [])
+    # Архивируем данные и очищаем рабочие таблицы для группы.
+    # Даже если архивирование или очистка завершатся с ошибкой,
+    # мы продолжим выполнение. Для надёжности выполняем операции
+    # последовательно и не оборачиваем их в общий try. Если
+    # возникнет исключение, оно будет выведено в логи, но не
+    # прервёт оставшийся код.
+    try:
+        archive_group_data(group_id)
+    except Exception as arch_err:
+        try:
+            print(f"Ошибка архивации данных для группы {group_id}: {arch_err}")
+        except Exception:
+            pass
+    try:
+        clear_group_data(group_id)
+    except Exception as clear_err:
+        try:
+            print(f"Ошибка очистки данных для группы {group_id}: {clear_err}")
+        except Exception:
+            pass
+
+    # Также сбрасываем временные структуры для данного чата: ASSIGNMENTS и TEXT_SESSIONS.
+    try:
+        init_assignments(group_id)
+        # Удаляем любую текущую сессию текстового сбора
+        TEXT_SESSIONS.pop(group_id, None)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------

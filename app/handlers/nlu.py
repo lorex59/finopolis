@@ -17,7 +17,12 @@ dp.include_router(nlu_router).
 from aiogram import Router, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
-from services.llm_api import classify_message, classify_intent_llm, extract_items_from_text
+from services.llm_api import (
+    classify_message,
+    classify_intent_llm,
+    extract_items_from_text,
+    extract_payment_from_text,
+)
 # Используем единый модуль базы данных из пакета ``app`` для работы с
 # таблицами. Это предотвращает возникновение нескольких экземпляров
 # ``database.py`` в разных местах проекта и гарантирует, что и бот, и
@@ -30,6 +35,7 @@ from app.database import (
     TEXT_SESSIONS,
     get_user,
     add_positions,
+    add_payment,
 )
 
 from handlers.receipts import finalize_receipt
@@ -212,6 +218,42 @@ async def handle_nlu_message(msg: Message):
         return
 
     # --- Неизвестный запрос ---
+    # Прежде чем сообщить о незнакомом запросе, попробуем распознать в тексте информацию
+    # о платеже. Пользователи могут писать «я заплатил 300 рублей», и бот должен
+    # зарегистрировать этот платеж. Используем функцию extract_payment_from_text
+    # для поиска сумм в сообщении.
+    # Попробуем распознать сообщение как платёж. Чтобы избежать
+    # ложных срабатываний (например, когда пользователь пишет "купил 2 яблока"),
+    # проверяем наличие ключевых слов, связанных с оплатой (заплатил, оплатил,
+    # перевёл, потратил) или обозначений валюты (руб, р, ₽).
+    payment_keywords = ["заплат", "оплат", "перевел", "перевёл", "потрат", "платеж", "платёж"]
+    currency_markers = ["руб", "р", "₽"]
+    lowered_text = text.lower()
+    should_try_payment = False
+    if any(k in lowered_text for k in payment_keywords) or any(c in lowered_text for c in currency_markers):
+        should_try_payment = True
+    if should_try_payment:
+        try:
+            payments = await extract_payment_from_text(text)
+        except Exception:
+            payments = []
+        if payments:
+            # Сохраняем каждый найденный платёж
+            group_id = str(msg.chat.id)
+            user_id = msg.from_user.id
+            lines: list[str] = []
+            for p in payments:
+                amt = p.get("amount")
+                desc = p.get("description")
+                try:
+                    # Добавляем платеж в базу
+                    add_payment(group_id, user_id, float(amt or 0), desc)
+                    lines.append(f"✅ Платёж на сумму {amt}₽ зарегистрирован.")
+                except Exception as e:
+                    lines.append(f"Ошибка при сохранении платежа: {e}")
+            await msg.answer("\n".join(lines))
+            return
+    # Если платежей не обнаружено — стандартный ответ
     await msg.answer(
         "Извините, я не понимаю. Напишите /help, чтобы узнать, что я умею."
     )

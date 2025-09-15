@@ -409,3 +409,93 @@ def _extract_items_from_text_regex(text: str) -> list[dict]:
             "price": price_val
         })
     return items
+
+# ---------------------------------------------------------------------------
+# Новый функционал: извлечение платежей из текстовых сообщений
+# ---------------------------------------------------------------------------
+# --- Модели и промпт для извлечения платежей ---
+class Payment(BaseModel):
+    amount: float = Field(description="Сумма платежа")
+    description: str = Field(description="Описание платежа")
+
+
+class PaymentList(RootModel[List[Payment]]):
+    pass
+
+# LLM, настроенный на вывод структурированных платежей. Используем тот же
+# базовый llm, но с отдельной схемой. Включаем raw для доступа к метаданным.
+structured_llm_payments = llm.with_structured_output(
+    PaymentList,
+    include_raw=True
+)
+
+# Промпт для извлечения платежей из свободного текста. Модель должна
+# вернуть строго JSON‑массив объектов с полями amount (число) и
+# description (строка). Если платежей в тексте нет, массив должен быть
+# пуст. Сумма может быть указана в рублях, сопровождаться словами
+# "руб", "рублей", "р", символом "₽" или суффиксом "к"/"k" (тысяча).
+TEXT_PAYMENTS_PROMPT = (
+    "Ты — ассистент для разбора платежей из свободного текста.\n"
+    "Тебе нужно найти суммы, которые пользователь заплатил, и вернуть строго JSON‑массив объектов с полями amount (число) и description (строка).\n"
+    "Если в сообщении нет платежей, верни пустой массив.\n"
+    "Сумма может быть записана как число с разделителем точкой или запятой, а также иметь суффикс 'к' или 'k', означающий тысячи.\n"
+    "Допускаются слова 'руб', 'руб.', 'рублей', 'р', '₽' рядом с числом.\n"
+    "Пример: 'я заплатил 300 рублей и ещё 2к за напитки' → [{{\"amount\": 300, \"description\": '300 рублей'}}, {{\"amount\": 2000, \"description\": '2к'}}].\n"
+    "Не добавляй никаких комментариев, только JSON‑массив.\n"
+    "Текст: {text}"
+)
+
+async def extract_payment_from_text(text: str) -> list[dict]:
+    """
+    Извлекает суммы платежей из свободного текста с помощью LLM. Если LLM
+    возвращает пустой список или недоступна, используется резервный
+    парсер на основе регулярных выражений. Возвращает список словарей
+    с полями `amount` (float) и `description` (исходная часть текста или
+    полное сообщение).
+
+    Args:
+        text: Текст сообщения пользователя.
+
+    Returns:
+        list[dict]: список объектов с полями `amount` и `description`.
+    """
+    from langchain_core.messages import HumanMessage
+    # Попытка распознать платежи с помощью LLM
+    try:
+        prompt = TEXT_PAYMENTS_PROMPT.format(text=text)
+        msg = HumanMessage(content=prompt)
+        ai_response = await structured_llm_payments.ainvoke([msg])
+        payments_model: list[Payment] = ai_response["parsed"].root if ai_response else []
+        # Если LLM вернула платежи, конвертируем их в списки словарей
+        parsed_payments: list[dict] = []
+        for p in payments_model:
+            try:
+                parsed_payments.append({"amount": float(p.amount), "description": str(p.description)})
+            except Exception:
+                continue
+        if parsed_payments:
+            return parsed_payments
+    except Exception:
+        # Игнорируем ошибку LLM; fallback ниже обработает
+        pass
+    # Fallback: регулярное выражение находит числа с необязательным суффиксом тысяч.
+    import re
+    lowered = text.lower()
+    # Удаляем разделители тысяч (пробелы и неразрывные пробелы), чтобы корректно парсить
+    lowered = lowered.replace('\u00a0', ' ').replace('\u202f', ' ')
+    pattern = re.compile(r"(\d+[\.,]?\d*)\s*(к|k)?")
+    payments: list[dict] = []
+    for match in pattern.finditer(lowered):
+        amt_str = match.group(1) or "0"
+        suffix = match.group(2)
+        try:
+            amt = float(amt_str.replace(',', '.'))
+        except Exception:
+            continue
+        if suffix:
+            amt *= 1000
+        payments.append({
+            "amount": round(amt, 2),
+            "description": text.strip(),
+        })
+    return payments

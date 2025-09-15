@@ -205,21 +205,24 @@ async def submit_selection(request: Request):
     # Determine group_id and selected data
     group_id = body.get("group_id")
     selected_data = body.get("selected", {})
+    # Новое поле equal: список индексов позиций, которые пользователь хочет
+    # разделить поровну. Для таких позиций мы сохраняем отрицательное количество
+    # (например, -1) в таблицу selected_positions, чтобы отличать от ручного ввода.
+    equal_data = body.get("equal", [])
     if not group_id:
         return JSONResponse({"error": "Missing group_id"}, status_code=400)
     group_id_str = str(group_id)
     user_id_int = user.id
-    # Build list of indices from selected_data
+    # Build list of indices for legacy assignments (используются только для
+    # fallback-расчётов). Используем только ручные (selected) позиции.
     indices: list[int] = []
     if isinstance(selected_data, dict):
-        # qty может быть дробным значением. Сохраняем как float.
         for idx_str, qty in selected_data.items():
             try:
                 idx = int(idx_str)
                 q_raw = float(qty)
             except Exception:
                 continue
-            # Для совместимости разворачиваем только целую часть количества.
             count = int(q_raw) if q_raw > 0 else 0
             for _ in range(count):
                 indices.append(idx)
@@ -235,6 +238,7 @@ async def submit_selection(request: Request):
         set_assignment(group_id_str, user_id_int, indices)
         all_positions = get_positions(group_id_str)
         selected_positions: list[dict] = []
+        # Обрабатываем ручные выборы (selected_data)
         if isinstance(selected_data, dict):
             for idx_str, qty in selected_data.items():
                 try:
@@ -258,6 +262,30 @@ async def submit_selection(request: Request):
                         "quantity": 1.0,
                         "price": orig.get("price"),
                     })
+        # Обрабатываем позиции для деления поровну (equal_data)
+        equal_indices: list[int] = []
+        if isinstance(equal_data, list):
+            for i in equal_data:
+                try:
+                    equal_indices.append(int(i))
+                except Exception:
+                    pass
+        # Исключаем повторное добавление одинаковых позиций (если указано и
+        # selected_data, и equal_data). Ручной выбор имеет приоритет.
+        for idx in equal_indices:
+            if 0 <= idx < len(all_positions):
+                # Проверяем, не выбран ли этот индекс вручную. Если выбран, не добавляем
+                if isinstance(selected_data, dict) and str(idx) in selected_data and float(selected_data[str(idx)]) > 0:
+                    continue
+                orig = all_positions[idx]
+                # Для отметки «поровну» используем отрицательное количество. Это
+                # позволит в дальнейшем определить, что пользователь пожелал
+                # поделить остаток поровну с другими участниками.
+                selected_positions.append({
+                    "name": orig.get("name"),
+                    "quantity": -1.0,
+                    "price": orig.get("price"),
+                })
         logger.debug("Сохраняем выбранные позиции: %s", selected_positions)
         save_selected_positions(group_id_str, user_id_int, selected_positions)
     except Exception as e:

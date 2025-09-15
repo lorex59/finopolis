@@ -128,6 +128,37 @@ def init_db() -> None:
             positions TEXT
         );
 
+        -- Архивные таблицы для хранения завершённых чеков. После выполнения
+        -- финального клиринга данные из текущих таблиц переносятся в
+        -- соответствующие архивные таблицы и удаляются из основных. Это
+        -- позволяет держать рабочие таблицы пустыми между расчётами,
+        -- одновременно сохраняя историю для отладочных целей.
+        CREATE TABLE IF NOT EXISTS archived_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT,
+            name TEXT,
+            quantity REAL,
+            price REAL,
+            archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS archived_selected_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT,
+            user_tg_id TEXT,
+            position_id INTEGER,
+            quantity REAL,
+            price REAL,
+            archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS archived_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_user_id TEXT,
+            group_id TEXT,
+            amount REAL,
+            positions TEXT,
+            archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
         -- Таблица для сохранения результатов расчётов долей.
         -- Каждая запись описывает, сколько пользователь должен
         -- заплатить по итогам расчёта для конкретного чека (receipt).
@@ -348,17 +379,11 @@ def save_selected_positions(group_id: str, user_id: int, positions: list[dict]) 
     # Сохраняем в базу данных
     conn = get_db_connection()
     cur = conn.cursor()
-    # Прежний выбор этого пользователя в группе больше не удаляется.
-    # Ранее реализация полностью очищала выбор пользователя перед
-    # сохранением новых позиций. Это приводило к тому, что при
-    # повторном выборе позиции предыдущее значение затиралось. В рамках
-    # исправления поведения мы не удаляем существующие записи, чтобы
-    # новые выбранные позиции добавлялись к уже сохранённым. Оставляем
-    # код удаления закомментированным для наглядности.
-    # cur.execute(
-    #     "DELETE FROM selected_positions WHERE group_id = ? AND user_tg_id = ?",
-    #     (str(group_id), str(user_id)),
-    # )
+    # Удаляем прежний выбор этого пользователя в группе
+    cur.execute(
+        "DELETE FROM selected_positions WHERE group_id = ? AND user_tg_id = ?",
+        (str(group_id), str(user_id)),
+    )
     if positions:
         for pos in positions:
             name = pos.get('name')
@@ -943,6 +968,67 @@ def get_unassigned_positions(group_id: str) -> list[dict]:
             })
     return unassigned
 
+# ---------------------------------------------------------------------------
+# Вспомогательные функции для архивации и очистки данных после клиринга
+# ---------------------------------------------------------------------------
+
+def archive_group_data(group_id: str) -> None:
+    """
+    Переносит текущие позиции, выборы и платежи группы в архивные таблицы.
+
+    После выполнения этой функции данные остаются в основных таблицах;
+    их необходимо удалить с помощью clear_group_data(). Архив создаётся для
+    отладки и отслеживания истории предыдущих расчётов.
+
+    Args:
+        group_id: Идентификатор группы (чата).
+    """
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        # Копируем позиции
+        cur.execute(
+            "INSERT INTO archived_positions (group_id, name, quantity, price) "
+            "SELECT group_id, name, quantity, price FROM positions WHERE group_id = ?",
+            (str(group_id),),
+        )
+        # Копируем выбранные позиции
+        cur.execute(
+            "INSERT INTO archived_selected_positions (group_id, user_tg_id, position_id, quantity, price) "
+            "SELECT group_id, user_tg_id, position_id, quantity, price FROM selected_positions WHERE group_id = ?",
+            (str(group_id),),
+        )
+        # Копируем платежи
+        cur.execute(
+            "INSERT INTO archived_payments (tg_user_id, group_id, amount, positions) "
+            "SELECT tg_user_id, group_id, amount, positions FROM payments WHERE group_id = ?",
+            (str(group_id),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_group_data(group_id: str) -> None:
+    """
+    Удаляет все записи о позициях, выбранных позициях и платежах для указанной группы.
+
+    Используйте эту функцию после переноса данных в архив (archive_group_data), чтобы
+    начать следующий расчёт с чистой базы данных.
+
+    Args:
+        group_id: Идентификатор группы (чата).
+    """
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM positions WHERE group_id = ?", (str(group_id),))
+        cur.execute("DELETE FROM selected_positions WHERE group_id = ?", (str(group_id),))
+        cur.execute("DELETE FROM payments WHERE group_id = ?", (str(group_id),))
+        conn.commit()
+    finally:
+        conn.close()
+
 
 def calculate_group_balance(group_id: str) -> list[tuple[int, int, float]]:
     """
@@ -967,19 +1053,111 @@ def calculate_group_balance(group_id: str) -> list[tuple[int, int, float]]:
         list[tuple[int, int, float]]: список переводов. Может быть пустым,
         если нет долгов или все балансы нулевые.
     """
-    # 1. Считаем стоимость выбранных позиций для каждого пользователя
-    selections = get_selected_positions(group_id) or {}
+    # 1. Считаем стоимость выбранных позиций для каждого пользователя.
+    #    В этой версии учитываем как ручные выборы, так и отметки «поровну».
+    #    Отметка «поровну» передаётся как отрицательное количество в таблице
+    #    selected_positions. Для корректного расчёта нам необходимо
+    #    знать исходное количество позиции (positions.quantity), чтобы
+    #    определить, какая часть остаётся на равное деление.
     cost_map: dict[int, float] = {}
-    for uid, pos_list in selections.items():
-        total = 0.0
-        for pos in pos_list:
-            try:
-                qty = float(pos.get("quantity", 0))
-                price = float(pos.get("price", 0))
-                total += qty * price
-            except Exception:
-                pass
-        cost_map[uid] = round(total, 2)
+    # Загружаем исходные позиции для группы: id → (qty, price)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, quantity, price FROM positions WHERE group_id = ?",
+        (str(group_id),),
+    )
+    pos_rows = cur.fetchall()
+    positions_map: dict[int, dict[str, float]] = {}
+    for row in pos_rows:
+        try:
+            pid = row["id"]
+            qty = float(row["quantity"] or 0)
+            price = float(row["price"] or 0)
+            positions_map[pid] = {"quantity": qty, "price": price}
+        except Exception:
+            pass
+    # Загружаем выбранные позиции
+    cur.execute(
+        "SELECT user_tg_id, position_id, quantity, price FROM selected_positions WHERE group_id = ?",
+        (str(group_id),),
+    )
+    sp_rows = cur.fetchall()
+    conn.close()
+    # Группируем выборы по позиции
+    selections_by_pos: dict[int | None, list[tuple[int, float, float]]] = {}
+    for row in sp_rows:
+        try:
+            uid_raw = row["user_tg_id"]
+            uid = int(uid_raw) if uid_raw is not None else None
+        except Exception:
+            uid = None
+        if uid is None:
+            continue
+        pos_id = row["position_id"]  # может быть None
+        qty_raw = row["quantity"]
+        try:
+            qty = float(qty_raw or 0)
+        except Exception:
+            qty = 0.0
+        price = None
+        try:
+            price = float(row["price"] or 0)
+        except Exception:
+            price = 0.0
+        selections_by_pos.setdefault(pos_id, []).append((uid, qty, price))
+    # Расчёт стоимости по каждому выбору
+    for pos_id, sel_list in selections_by_pos.items():
+        # Если позиция ссылается на запись в positions, используем её
+        if pos_id is not None and pos_id in positions_map:
+            orig = positions_map[pos_id]
+            total_qty = float(orig.get("quantity", 0))
+            price = float(orig.get("price", 0))
+            # Суммируем ручные количества и собираем пользователей, выбравших поровну
+            manual_sum = 0.0
+            equal_users: list[int] = []
+            for uid, qty, _price in sel_list:
+                if qty is None:
+                    continue
+                try:
+                    qval = float(qty)
+                except Exception:
+                    qval = 0.0
+                if qval >= 0:
+                    manual_sum += qval
+                else:
+                    equal_users.append(uid)
+            # Расходы по ручным выбором
+            for uid, qty, _price in sel_list:
+                if qty is None:
+                    continue
+                try:
+                    qval = float(qty)
+                except Exception:
+                    qval = 0.0
+                if qval > 0:
+                    cost_map[uid] = cost_map.get(uid, 0.0) + qval * price
+            # Расходы по отметкам «поровну»
+            leftover = max(total_qty - manual_sum, 0.0)
+            if equal_users:
+                share = leftover / len(equal_users)
+                for uid in equal_users:
+                    cost_map[uid] = cost_map.get(uid, 0.0) + share * price
+        else:
+            # Позиция не сопоставлена с исходными записями (position_id = NULL).
+            # Считаем стоимость как qty * price. Отрицательные количества
+            # игнорируем (неизвестный механизм «поровну» без исходного qty).
+            for uid, qty, price in sel_list:
+                try:
+                    qval = float(qty)
+                except Exception:
+                    qval = 0.0
+                try:
+                    pval = float(price)
+                except Exception:
+                    pval = 0.0
+                if qval > 0:
+                    cost_map[uid] = cost_map.get(uid, 0.0) + qval * pval
     # 2. Считаем внесённые платежи
     payments_map = get_payments(group_id) or {}
     # 3. Список всех участников (те, кто что‑то выбрал или оплатил)
