@@ -180,6 +180,29 @@ async def handle_nlu_message(msg: Message):
         await finalize_receipt(msg)
         return
 
+    if intent == "pay":
+        # Обработка платежей, если пользователь сообщает о платеже напрямую.
+        try:
+            payments = await extract_payment_from_text(text)
+        except Exception:
+            payments = []
+        if payments:
+            group_id = str(msg.chat.id)
+            user_id = msg.from_user.id
+            lines_msgs: list[str] = []
+            for p in payments:
+                amt = p.get("amount")
+                desc = p.get("description")
+                try:
+                    add_payment(group_id, user_id, float(amt or 0), desc)
+                    lines_msgs.append(f"✅ Платёж на сумму {amt}₽ зарегистрирован.")
+                except Exception as e:
+                    lines_msgs.append(f"Ошибка при сохранении платежа: {e}")
+            await msg.answer("\n".join(lines_msgs))
+        else:
+            await msg.answer("Не удалось распознать сумму платежа. Укажите, сколько и что вы оплатили.")
+        return
+
     if intent == "help":
         await msg.answer(
             "Я могу помочь распределять расходы по чеку. Отправьте фото чека,\n"

@@ -184,7 +184,7 @@ async def classify_intent_llm(text: str) -> str:
     system_prompt = (
         "Ты помощник по классификации. Категоризируй пользовательский запрос "
         "на одну из категорий: greet, list_positions, calculate, delete_position, "
-        "edit_position, add_position, finalize, help, unknown. Ответь только названием категории "
+        "edit_position, add_position, finalize, help, pay, unknown. Ответь только названием категории "
         "без других слов.\n"
     )
     # Формируем список сообщений для модели: системное и пользовательское
@@ -209,9 +209,9 @@ async def classify_intent_llm(text: str) -> str:
             "add_position",
             "finalize",
             "help",
+            "pay",
             "unknown",
-        }
-        # Удаляем все символы, кроме латинских букв, цифр и подчёркивания
+        }# Удаляем все символы, кроме латинских букв, цифр и подчёркивания
         import re
         cleaned = re.sub(r"[^a-zA-Z0-9_]+", "", content)
         return cleaned if cleaned in valid else "unknown"
@@ -236,6 +236,9 @@ def classify_message_heuristic(text: str) -> str:
         # фразы вроде "добавь", "хочу добавить", "добавь позицию" указывают на необходимость
         # добавить новые позиции по тексту. Возвращаем add_position.
         return "add_position"
+    # запись платежей
+    if any(word in lowered for word in ["заплат", "оплат", "перевел", "перевёл", "перевод", "платеж", "платёж", "pay"]):
+        return "pay"
     # запрос списка позиций
     if any(word in lowered for word in ["список", "позиции", "товары", "что", "добавлено", "покажи"]):
         return "list_positions"

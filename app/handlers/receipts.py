@@ -578,6 +578,29 @@ async def finalize_receipt(msg: Message):
         user_transfers.setdefault(creditor_id, {"out": [], "in": []})
         user_transfers[debtor_id]["out"].append((creditor_id, float(amount)))
         user_transfers[creditor_id]["in"].append((debtor_id, float(amount)))
+    
+    # Вычисляем баланс (платежи - стоимость) для каждого участника
+    balances_map: dict[int, float] = {}
+    try:
+        # Формируем карту расходов по выбранным позициям
+        cost_map_tmp: dict[int, float] = {}
+        for _uid, _plist in selections.items():
+            total_cost = 0.0
+            for _pos in _plist:
+                try:
+                    qty_val = float(_pos.get('quantity', 0))
+                    price_val = float(_pos.get('price', 0))
+                    total_cost += qty_val * price_val
+                except Exception:
+                    pass
+            cost_map_tmp[int(_uid)] = round(total_cost, 2)
+        all_bal_users = set(cost_map_tmp.keys()) | set(payments.keys())
+        for _u in all_bal_users:
+            paid = payments.get(_u, 0.0)
+            spent = cost_map_tmp.get(_u, 0.0)
+            balances_map[_u] = round(paid - spent, 2)
+    except Exception:
+        balances_map = {}
     # Определяем полный список участников: те, кто выбрал позиции или внёс платежи.
     all_user_ids: set[int] = set(selections.keys()) | set(payments.keys())
     # Отправляем каждому пользователю личное сообщение. Если пользователь не участвовал
@@ -597,7 +620,12 @@ async def finalize_receipt(msg: Message):
             debtor_name = debtor_info.get('full_name') or debtor_info.get('phone') or str(debtor_id)
             messages.append(f"{debtor_name} должен вам {amount}₽.")
         if not messages:
-            messages.append("Ваш баланс нулевой. Нет обязательств.")
+            bal = balances_map.get(uid, 0.0)
+            if abs(bal) > 0.01:
+                sign = '+' if bal > 0 else ''
+                messages.append(f'Ваш баланс {sign}{bal}₽. Нет обязательств.')
+            else:
+                messages.append('Ваш баланс нулевой. Нет обязательств.')
         if group_link:
             messages.append(f"Группа: {group_link}")
         try:
@@ -618,6 +646,33 @@ async def finalize_receipt(msg: Message):
         summary_lines.append("\nПодробности отправлены каждому участнику в личные сообщения.")
     else:
         summary_lines.append("\nВсе расчёты закрыты. Нет обязательств между участниками.")
+        # Добавляем информацию о балансе каждого участника
+        try:
+            # Формируем карту расходов по выбранным позициям для отчёта
+            report_cost_map: dict[int, float] = {}
+            for _uid, _plist in selections.items():
+                total_cost = 0.0
+                for _pos in _plist:
+                    try:
+                        qty_val = float(_pos.get('quantity', 0))
+                        price_val = float(_pos.get('price', 0))
+                        total_cost += qty_val * price_val
+                    except Exception:
+                        pass
+                report_cost_map[int(_uid)] = round(total_cost, 2)
+            all_rep_users = set(report_cost_map.keys()) | set(payments.keys())
+            if all_rep_users:
+                summary_lines.append("\n<b>Баланс группы:</b>")
+            for _u in all_rep_users:
+                spent = report_cost_map.get(_u, 0.0)
+                paid = payments.get(_u, 0.0)
+                diff = round(paid - spent, 2)
+                u_info = get_user(_u) or {}
+                u_name = u_info.get('full_name') or u_info.get('phone') or str(_u)
+                sign = '+' if diff >= 0 else ''
+                summary_lines.append(f"{u_name} ({_u}): потратил {spent}₽, оплатил {paid}₽ → баланс {sign}{diff}₽")
+        except Exception:
+            pass
     await msg.answer("\n".join(summary_lines), parse_mode="HTML")
     # Архивируем данные и очищаем рабочие таблицы для группы.
     # Даже если архивирование или очистка завершатся с ошибкой,
