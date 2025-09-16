@@ -561,13 +561,22 @@ async def finalize_receipt(msg: Message):
     save_debts(receipt_id, debt_mapping)
     fake_tx_id = "manual_clear"
     log_payment(receipt_id, fake_tx_id, debt_mapping)
-    # Ссылка на группу для удобства пользователей. Для супергрупп Telegram использует
-    # идентификаторы вида -100.... Чтобы построить ссылку, убираем префикс -100.
+    # Ссылка на группу для удобства пользователей. Если у группы есть username,
+    # используем https://t.me/<username>. Если это супергруппа (chat_id
+    # начинается с -100), используем формат https://t.me/c/<id без -100>.
     group_link = ""
     try:
-        chat_id_str = str(msg.chat.id)
-        if chat_id_str.startswith("-100"):
-            group_link = f"https://t.me/c/{chat_id_str[4:]}"
+        # При наличии username Telegram генерирует персонализированную ссылку
+        chat_username = getattr(msg.chat, 'username', None)
+        if chat_username:
+            group_link = f"https://t.me/{chat_username}"
+        else:
+            chat_id_str = str(msg.chat.id)
+            if chat_id_str.startswith("-100"):
+                group_link = f"https://t.me/c/{chat_id_str[4:]}"
+            elif chat_id_str.startswith("-"):
+                # Для обычных групп без username пробуем t.me/c/<abs(id)>
+                group_link = f"https://t.me/c/{chat_id_str[1:]}"
     except Exception:
         group_link = ""
     # Строим персональные сообщения для каждого участника. Собираем входящие и исходящие
@@ -579,28 +588,135 @@ async def finalize_receipt(msg: Message):
         user_transfers[debtor_id]["out"].append((creditor_id, float(amount)))
         user_transfers[creditor_id]["in"].append((debtor_id, float(amount)))
     
-    # Вычисляем баланс (платежи - стоимость) для каждого участника
+    # Вычисляем баланс (платежи - стоимость) для каждого участника.
+    # Для корректного расчёта стоимости учтём ручные выборы и отметки «поровну».
     balances_map: dict[int, float] = {}
+    from app.database import get_db_connection
     try:
-        # Формируем карту расходов по выбранным позициям
-        cost_map_tmp: dict[int, float] = {}
-        for _uid, _plist in selections.items():
-            total_cost = 0.0
-            for _pos in _plist:
-                try:
-                    qty_val = float(_pos.get('quantity', 0))
-                    price_val = float(_pos.get('price', 0))
-                    total_cost += qty_val * price_val
-                except Exception:
-                    pass
-            cost_map_tmp[int(_uid)] = round(total_cost, 2)
-        all_bal_users = set(cost_map_tmp.keys()) | set(payments.keys())
-        for _u in all_bal_users:
-            paid = payments.get(_u, 0.0)
-            spent = cost_map_tmp.get(_u, 0.0)
-            balances_map[_u] = round(paid - spent, 2)
+        conn2 = get_db_connection()
+        cur2 = conn2.cursor()
+        # Загружаем исходные позиции
+        cur2.execute(
+            "SELECT id, quantity, price FROM positions WHERE group_id = ?",
+            (str(group_id),),
+        )
+        pos_rows2 = cur2.fetchall()
+        pos_map2: dict[int, dict[str, float]] = {}
+        for row in pos_rows2:
+            try:
+                pid = row["id"]
+                pos_map2[pid] = {
+                    "quantity": float(row["quantity"] or 0),
+                    "price": float(row["price"] or 0),
+                }
+            except Exception:
+                pass
+        # Загружаем выбранные позиции
+        cur2.execute(
+            "SELECT user_tg_id, position_id, quantity, price FROM selected_positions WHERE group_id = ?",
+            (str(group_id),),
+        )
+        sp_rows2 = cur2.fetchall()
+        selections_by_pos2: dict[int | None, list[tuple[int, float, float]]] = {}
+        for row in sp_rows2:
+            try:
+                uid_raw = row["user_tg_id"]
+                uid_int2 = int(uid_raw) if uid_raw is not None else None
+            except Exception:
+                uid_int2 = None
+            if uid_int2 is None:
+                continue
+            pos_id2 = row["position_id"]
+            qty_raw2 = row["quantity"]
+            try:
+                qv2 = float(qty_raw2 or 0)
+            except Exception:
+                qv2 = 0.0
+            pval2 = None
+            try:
+                pval2 = float(row["price"] or 0)
+            except Exception:
+                pval2 = 0.0
+            selections_by_pos2.setdefault(pos_id2, []).append((uid_int2, qv2, pval2))
+        cost_map2: dict[int, float] = {}
+        for pos_id2, sel_list2 in selections_by_pos2.items():
+            if pos_id2 is not None and pos_id2 in pos_map2:
+                orig2 = pos_map2[pos_id2]
+                total_qty2 = float(orig2.get("quantity", 0))
+                price2 = float(orig2.get("price", 0))
+                manual_sum2 = 0.0
+                equal_users2: list[int] = []
+                for uid_int2, qty_val2, _p2 in sel_list2:
+                    if qty_val2 is None:
+                        continue
+                    try:
+                        qvtmp = float(qty_val2)
+                    except Exception:
+                        qvtmp = 0.0
+                    if qvtmp >= 0:
+                        manual_sum2 += qvtmp
+                    else:
+                        equal_users2.append(uid_int2)
+                # Ручной расход
+                for uid_int2, qty_val2, _p2 in sel_list2:
+                    if qty_val2 is None:
+                        continue
+                    try:
+                        qvtmp = float(qty_val2)
+                    except Exception:
+                        qvtmp = 0.0
+                    if qvtmp > 0:
+                        cost_map2[uid_int2] = cost_map2.get(uid_int2, 0.0) + qvtmp * price2
+                leftover2 = max(total_qty2 - manual_sum2, 0.0)
+                if equal_users2:
+                    share2 = leftover2 / len(equal_users2) if len(equal_users2) > 0 else 0.0
+                    for uid_int2 in equal_users2:
+                        cost_map2[uid_int2] = cost_map2.get(uid_int2, 0.0) + share2 * price2
+            else:
+                for uid_int2, qty_val2, price_val2 in sel_list2:
+                    try:
+                        qvtmp = float(qty_val2)
+                    except Exception:
+                        qvtmp = 0.0
+                    try:
+                        pvt2 = float(price_val2)
+                    except Exception:
+                        pvt2 = 0.0
+                    if qvtmp > 0:
+                        cost_map2[uid_int2] = cost_map2.get(uid_int2, 0.0) + qvtmp * pvt2
+        # Теперь вычисляем балансы: оплачено - потрачено
+        all_bal_users2 = set(cost_map2.keys()) | set(payments.keys())
+        for uid in all_bal_users2:
+            paid_amt = payments.get(uid, 0.0)
+            spent_amt = cost_map2.get(uid, 0.0)
+            balances_map[uid] = round(paid_amt - spent_amt, 2)
     except Exception:
+        # Fallback: если что-то сломалось, попробуем простой расчёт
         balances_map = {}
+        try:
+            cost_map_simple: dict[int, float] = {}
+            for _uid, _plist in selections.items():
+                total_cost_simple = 0.0
+                for _pos in _plist:
+                    try:
+                        qtmp = float(_pos.get('quantity', 0))
+                        ptmp = float(_pos.get('price', 0))
+                        total_cost_simple += qtmp * ptmp
+                    except Exception:
+                        pass
+                cost_map_simple[int(_uid)] = round(total_cost_simple, 2)
+            all_users_simple = set(cost_map_simple.keys()) | set(payments.keys())
+            for _uid in all_users_simple:
+                paid = payments.get(_uid, 0.0)
+                spent = cost_map_simple.get(_uid, 0.0)
+                balances_map[_uid] = round(paid - spent, 2)
+        except Exception:
+            balances_map = {}
+    finally:
+        try:
+            conn2.close()
+        except Exception:
+            pass
     # Определяем полный список участников: те, кто выбрал позиции или внёс платежи.
     all_user_ids: set[int] = set(selections.keys()) | set(payments.keys())
     # Отправляем каждому пользователю личное сообщение. Если пользователь не участвовал
@@ -646,31 +762,117 @@ async def finalize_receipt(msg: Message):
         summary_lines.append("\nПодробности отправлены каждому участнику в личные сообщения.")
     else:
         summary_lines.append("\nВсе расчёты закрыты. Нет обязательств между участниками.")
-        # Добавляем информацию о балансе каждого участника
+        # Добавляем информацию о балансе каждого участника. Для расчёта
+        # используем ту же логику стоимости, что и в calculate_group_balance.
         try:
-            # Формируем карту расходов по выбранным позициям для отчёта
+            from app.database import get_db_connection
+            conn_rep = get_db_connection()
+            cur_rep = conn_rep.cursor()
+            # Сформируем карту исходных позиций
+            cur_rep.execute(
+                "SELECT id, quantity, price FROM positions WHERE group_id = ?",
+                (str(group_id),),
+            )
+            pos_rows_rep = cur_rep.fetchall()
+            positions_map_rep: dict[int, dict[str, float]] = {}
+            for row in pos_rows_rep:
+                try:
+                    positions_map_rep[row["id"]] = {
+                        "quantity": float(row["quantity"] or 0),
+                        "price": float(row["price"] or 0),
+                    }
+                except Exception:
+                    pass
+            # Выборки
+            cur_rep.execute(
+                "SELECT user_tg_id, position_id, quantity, price FROM selected_positions WHERE group_id = ?",
+                (str(group_id),),
+            )
+            sel_rows_rep = cur_rep.fetchall()
+            selections_by_pos_rep: dict[int | None, list[tuple[int, float, float]]] = {}
+            for row in sel_rows_rep:
+                try:
+                    uid_raw = row["user_tg_id"]
+                    uid_int_rep = int(uid_raw) if uid_raw is not None else None
+                except Exception:
+                    uid_int_rep = None
+                if uid_int_rep is None:
+                    continue
+                pid_rep = row["position_id"]
+                qty_rep = 0.0
+                try:
+                    qty_rep = float(row["quantity"] or 0)
+                except Exception:
+                    qty_rep = 0.0
+                price_rep = 0.0
+                try:
+                    price_rep = float(row["price"] or 0)
+                except Exception:
+                    price_rep = 0.0
+                selections_by_pos_rep.setdefault(pid_rep, []).append((uid_int_rep, qty_rep, price_rep))
             report_cost_map: dict[int, float] = {}
-            for _uid, _plist in selections.items():
-                total_cost = 0.0
-                for _pos in _plist:
-                    try:
-                        qty_val = float(_pos.get('quantity', 0))
-                        price_val = float(_pos.get('price', 0))
-                        total_cost += qty_val * price_val
-                    except Exception:
-                        pass
-                report_cost_map[int(_uid)] = round(total_cost, 2)
+            for pid_rep, sel_list_rep in selections_by_pos_rep.items():
+                if pid_rep is not None and pid_rep in positions_map_rep:
+                    orig_rep = positions_map_rep[pid_rep]
+                    total_qty_rep = float(orig_rep.get("quantity", 0))
+                    price_val_rep = float(orig_rep.get("price", 0))
+                    manual_sum_rep = 0.0
+                    equal_users_rep: list[int] = []
+                    for uid_int_rep, qty_val_rep, _pr in sel_list_rep:
+                        if qty_val_rep is None:
+                            continue
+                        try:
+                            q_tmp_rep = float(qty_val_rep)
+                        except Exception:
+                            q_tmp_rep = 0.0
+                        if q_tmp_rep >= 0:
+                            manual_sum_rep += q_tmp_rep
+                        else:
+                            equal_users_rep.append(uid_int_rep)
+                    # manual
+                    for uid_int_rep, qty_val_rep, _pr in sel_list_rep:
+                        if qty_val_rep is None:
+                            continue
+                        try:
+                            q_tmp_rep = float(qty_val_rep)
+                        except Exception:
+                            q_tmp_rep = 0.0
+                        if q_tmp_rep > 0:
+                            report_cost_map[uid_int_rep] = report_cost_map.get(uid_int_rep, 0.0) + q_tmp_rep * price_val_rep
+                    # поровну
+                    leftover_rep = max(total_qty_rep - manual_sum_rep, 0.0)
+                    if equal_users_rep:
+                        share_rep = leftover_rep / len(equal_users_rep) if len(equal_users_rep) > 0 else 0.0
+                        for uid_int_rep in equal_users_rep:
+                            report_cost_map[uid_int_rep] = report_cost_map.get(uid_int_rep, 0.0) + share_rep * price_val_rep
+                else:
+                    for uid_int_rep, qty_val_rep, price_val_rep2 in sel_list_rep:
+                        try:
+                            q_tmp_rep = float(qty_val_rep)
+                        except Exception:
+                            q_tmp_rep = 0.0
+                        try:
+                            price_val_rep3 = float(price_val_rep2)
+                        except Exception:
+                            price_val_rep3 = 0.0
+                        if q_tmp_rep > 0:
+                            report_cost_map[uid_int_rep] = report_cost_map.get(uid_int_rep, 0.0) + q_tmp_rep * price_val_rep3
+            # Все участники, участвовавшие в выборе или оплате
             all_rep_users = set(report_cost_map.keys()) | set(payments.keys())
             if all_rep_users:
                 summary_lines.append("\n<b>Баланс группы:</b>")
             for _u in all_rep_users:
-                spent = report_cost_map.get(_u, 0.0)
-                paid = payments.get(_u, 0.0)
+                spent = round(report_cost_map.get(_u, 0.0), 2)
+                paid = round(payments.get(_u, 0.0), 2)
                 diff = round(paid - spent, 2)
                 u_info = get_user(_u) or {}
                 u_name = u_info.get('full_name') or u_info.get('phone') or str(_u)
                 sign = '+' if diff >= 0 else ''
                 summary_lines.append(f"{u_name} ({_u}): потратил {spent}₽, оплатил {paid}₽ → баланс {sign}{diff}₽")
+            try:
+                conn_rep.close()
+            except Exception:
+                pass
         except Exception:
             pass
     await msg.answer("\n".join(summary_lines), parse_mode="HTML")
@@ -796,30 +998,137 @@ async def cmd_balance(msg: Message):
     if not selections and not payments_map:
         await msg.answer("Нет данных для расчёта баланса. Сначала распределите позиции или внесите платежи.")
         return
-    # Формируем cost_map: пользователь → сумма по выбранным позициям
+    # -------------------------------------------------------------------
+    # Формируем cost_map: пользователь → сумма по выбранным позициям.
+    # Учитываем как ручные выборы, так и отметки «поровну». Для
+    # корректного расчёта нам нужно знать исходное количество и цену
+    # каждой позиции, поэтому делаем прямой запрос к таблицам positions
+    # и selected_positions, аналогичный логике calculate_group_balance.
+    from app.database import get_db_connection
     cost_map: dict[int, float] = {}
-    for uid, pos_list in selections.items():
-        total = 0.0
-        for pos in pos_list:
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Загружаем исходные позиции
+        cur.execute(
+            "SELECT id, quantity, price FROM positions WHERE group_id = ?",
+            (str(group_id),),
+        )
+        pos_rows = cur.fetchall()
+        positions_map: dict[int, dict[str, float]] = {}
+        for row in pos_rows:
             try:
-                qty = float(pos.get("quantity", 0))
-                price = float(pos.get("price", 0))
-                total += qty * price
+                pid = row["id"]
+                qval = float(row["quantity"] or 0)
+                pval = float(row["price"] or 0)
+                positions_map[pid] = {"quantity": qval, "price": pval}
             except Exception:
                 pass
-        cost_map[uid] = round(total, 2)
+        # Загружаем выбранные позиции
+        cur.execute(
+            "SELECT user_tg_id, position_id, quantity, price FROM selected_positions WHERE group_id = ?",
+            (str(group_id),),
+        )
+        sp_rows = cur.fetchall()
+        selections_by_pos: dict[int | None, list[tuple[int, float, float]]] = {}
+        for row in sp_rows:
+            try:
+                uid_raw = row["user_tg_id"]
+                uid_int = int(uid_raw) if uid_raw is not None else None
+            except Exception:
+                uid_int = None
+            if uid_int is None:
+                continue
+            pos_id = row["position_id"]
+            qty_raw = row["quantity"]
+            try:
+                qty_val = float(qty_raw or 0)
+            except Exception:
+                qty_val = 0.0
+            price_val = None
+            try:
+                price_val = float(row["price"] or 0)
+            except Exception:
+                price_val = 0.0
+            selections_by_pos.setdefault(pos_id, []).append((uid_int, qty_val, price_val))
+        # Расчёт стоимости по каждому выбору
+        for pos_id, sel_list in selections_by_pos.items():
+            if pos_id is not None and pos_id in positions_map:
+                orig = positions_map[pos_id]
+                total_qty = float(orig.get("quantity", 0))
+                price = float(orig.get("price", 0))
+                manual_sum = 0.0
+                equal_users: list[int] = []
+                for uid_int, qty_val, _p in sel_list:
+                    if qty_val is None:
+                        continue
+                    try:
+                        qv = float(qty_val)
+                    except Exception:
+                        qv = 0.0
+                    if qv >= 0:
+                        manual_sum += qv
+                    else:
+                        equal_users.append(uid_int)
+                # Стоимость по ручным количествам
+                for uid_int, qty_val, _p in sel_list:
+                    if qty_val is None:
+                        continue
+                    try:
+                        qv = float(qty_val)
+                    except Exception:
+                        qv = 0.0
+                    if qv > 0:
+                        cost_map[uid_int] = cost_map.get(uid_int, 0.0) + qv * price
+                # Стоимость по поровну
+                leftover = max(total_qty - manual_sum, 0.0)
+                if equal_users:
+                    share = leftover / len(equal_users) if len(equal_users) > 0 else 0.0
+                    for uid_int in equal_users:
+                        cost_map[uid_int] = cost_map.get(uid_int, 0.0) + share * price
+            else:
+                # Позиция не сопоставлена с исходной записью
+                for uid_int, qty_val, price_val in sel_list:
+                    try:
+                        qv = float(qty_val)
+                    except Exception:
+                        qv = 0.0
+                    try:
+                        pv = float(price_val)
+                    except Exception:
+                        pv = 0.0
+                    if qv > 0:
+                        cost_map[uid_int] = cost_map.get(uid_int, 0.0) + qv * pv
+    except Exception:
+        # Если что‑то пошло не так, fallback: суммируем qty*price из selections
+        cost_map = {}
+        for uid, pos_list in selections.items():
+            total = 0.0
+            for pos in pos_list:
+                try:
+                    qty = float(pos.get("quantity", 0))
+                    price = float(pos.get("price", 0))
+                    total += qty * price
+                except Exception:
+                    pass
+            cost_map[uid] = round(total, 2)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
     # Список всех участников
     users = set(cost_map.keys()) | set(payments_map.keys())
     # Строим строки с балансом по каждому
     lines: list[str] = ["<b>Баланс группы:</b>"]
     for uid in users:
-        spent = cost_map.get(uid, 0.0)
-        paid = payments_map.get(uid, 0.0)
-        diff = round(paid - spent, 2)
+        spent_val = round(cost_map.get(uid, 0.0), 2)
+        paid_val = round(payments_map.get(uid, 0.0), 2)
+        diff = round(paid_val - spent_val, 2)
         user_info = get_user(uid) or {}
         name = user_info.get('full_name') or user_info.get('phone') or str(uid)
         sign = "+" if diff >= 0 else ""
-        lines.append(f"{name} ({uid}): потратил {spent}₽, оплатил {paid}₽ → баланс {sign}{diff}₽")
+        lines.append(f"{name} ({uid}): потратил {spent_val}₽, оплатил {paid_val}₽ → баланс {sign}{diff}₽")
     # Получаем оптимальные переводы
     transfers = calculate_group_balance(group_id)
     if transfers:
