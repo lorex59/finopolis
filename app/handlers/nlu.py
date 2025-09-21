@@ -36,7 +36,33 @@ from app.database import (
     get_user,
     add_positions,
     add_payment,
+    get_all_users
 )
+
+# --- helper ---
+def _resolve_username_to_user_id(username: str) -> int | None:
+    """
+    Возвращает telegram_id пользователя по его username (с @ или без).
+    Сравнение без учёта регистра. Берём из колонки accounts.telegram_login.
+    """
+    if not username:
+        return None
+    uname = username.strip()
+    if not uname:
+        return None
+    # нормализуем к виду "@name"
+    if not uname.startswith("@"):
+        uname = "@" + uname
+    uname_cf = uname.casefold()
+
+    for uid, data in get_all_users():
+        tl = (data or {}).get("telegram_login")
+        if not tl:
+            continue
+        tl_norm = tl if tl.startswith("@") else "@" + tl
+        if tl_norm.casefold() == uname_cf:
+            return int(uid)
+    return None
 
 from handlers.receipts import finalize_receipt
 
@@ -60,11 +86,9 @@ async def handle_nlu_message(msg: Message):
     # --- Сбор сообщений для текстового сценария ---
     if session and session.get("collecting"):
         lowered = text.lower()
-        # Пользователь завершает ввод
         if any(word in lowered for word in ["закончен", "закончена", "завершил", "готово", "конец"]):
             messages = end_text_session(chat_id)
             await msg.answer("✅ Текстовый сбор сообщений завершён. Начинаю расчёт...")
-            # Вызываем /finalize как будто это команда
             await finalize_receipt(msg)
         else:
             append_text_message(chat_id, text)
@@ -72,8 +96,6 @@ async def handle_nlu_message(msg: Message):
         return
 
     # --- Классификация запроса ---
-    # Используем LLM для определения намерения. Этот вызов может
-    # завершиться эвристикой, если LLM недоступен.
     intent = await classify_intent_llm(text)
 
     # --- Реакции на намерения ---
@@ -90,15 +112,13 @@ async def handle_nlu_message(msg: Message):
                 "Добавьте меня в группу, чтобы делить чеки с друзьями."
             )
         return
-    # Добавление позиций по тексту
+
     if intent == "add_position":
-        # Получаем список новых позиций из текста через LLM
         try:
             items = await extract_items_from_text(text)
         except Exception:
-            # Если LLM недоступна или произошла ошибка — сообщаем пользователю
             await msg.answer(
-                "Не удалось распознать позиции. Попробуйте ещё раз или воспользуйтесь мини‑приложением."
+                "Не удалось распознать позиции. Попробуйте ещё раз или воспользуйтесь мини-приложением."
             )
             return
         if not items:
@@ -106,23 +126,18 @@ async def handle_nlu_message(msg: Message):
                 "Не удалось распознать позиции в сообщении. Попробуйте указать название и цену, например: 'такси за 300'."
             )
             return
-        # Преобразуем Pydantic Item в обычные dict
         new_positions = []
         for item in items:
             try:
-                # каждая Item имеет атрибуты name, quantity, price
                 new_positions.append({
                     "name": item.name,
                     "quantity": item.quantity,
                     "price": item.price,
                 })
             except Exception:
-                # fallback: если это уже dict
                 new_positions.append(item)
-        # Сохраняем позиции для текущей группы
         group_id = str(msg.chat.id)
         add_positions(group_id, new_positions)
-        # Формируем ответ пользователю
         lines = []
         for item in new_positions:
             name = item.get("name")
@@ -131,9 +146,7 @@ async def handle_nlu_message(msg: Message):
             price_str = f"{price:.0f}" if price == int(price) else f"{price:.2f}"
             qty_str = f"{quantity:.0f}" if quantity == int(quantity) else f"{quantity:.2f}"
             lines.append(f"{name} — {qty_str} x {price_str}₽")
-        await msg.answer(
-            "Добавлены позиции:\n" + "\n".join(lines)
-        )
+        await msg.answer("Добавлены позиции:\n" + "\n".join(lines))
         return
 
     if intent == "list_positions":
@@ -148,7 +161,6 @@ async def handle_nlu_message(msg: Message):
         return
 
     if intent == "calculate":
-        # Предложить пользователю выбрать способ расчёта: мини‑приложение или текст
         kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
         kb.add(KeyboardButton(text="Мини-приложение"))
         kb.add(KeyboardButton(text="Текстовый ввод"))
@@ -156,57 +168,77 @@ async def handle_nlu_message(msg: Message):
             "Как будем считать расходы? Выберите:\n- \U0001F4D1 Мини-приложение\n- \U0001F4D1 Текстовый ввод",
             reply_markup=kb,
         )
-        # Помечаем, что ждём выбора пользователя
         TEXT_SESSIONS[chat_id] = {"collecting": False, "messages": [], "await_choice": True}
         return
 
     if intent == "delete_position":
-        # Пока что не реализуем автоматическое удаление через естественный язык.
-        # Просим пользователя воспользоваться командой /show и кнопками для удаления.
         await msg.answer(
             "Чтобы удалить позицию, отправьте /show и нажмите соответствующую кнопку ✖️ рядом с нужной позицией."
         )
         return
 
     if intent == "edit_position":
-        # Аналогично, редактирование через НЛУ не поддержано. Предлагаем использовать кнопки.
         await msg.answer(
             "Чтобы изменить позицию или добавить новую, отправьте /show и воспользуйтесь кнопками '✏️' для редактирования и '➕' для добавления."
         )
         return
 
     if intent == "finalize":
-        # Пользователь просит завершить расчёт
         await finalize_receipt(msg)
         return
 
     if intent == "pay":
-        # Обработка платежей, если пользователь сообщает о платеже напрямую.
         try:
             payments = await extract_payment_from_text(text)
         except Exception:
             payments = []
+
         if payments:
             group_id = str(msg.chat.id)
-            user_id = msg.from_user.id
+
+            # Получим карту username -> telegram_id из базы
+            # get_all_users() -> List[(telegram_id:int, data:dict{..., telegram_login:str})]
+            login_to_id: dict[str, int] = {}
+            try:
+                for uid, data in get_all_users():
+                    login = (data or {}).get("telegram_login")
+                    if login:
+                        login_to_id[login.lstrip("@").lower()] = int(uid)
+            except Exception:
+                # в худшем случае просто останется пустым
+                pass
+
             lines_msgs: list[str] = []
             for p in payments:
-                amt = p.get("amount")
-                desc = p.get("description")
+                amt = float(p.get("amount") or 0)
+                desc = p.get("description") or ""
+                target_login = p.get("user_login")  # без '@', в нижнем регистре
+
+                # Определяем пользователя-плательщика: либо из user_login, либо автор сообщения
+                if target_login:
+                    payer_id = login_to_id.get(target_login.lower())
+                    if payer_id is None:
+                        lines_msgs.append(f"⚠️ Не нашёл пользователя @{target_login} в базе — платёж {amt:.0f}₽ не сохранён.")
+                        continue
+                else:
+                    payer_id = msg.from_user.id
+
                 try:
-                    add_payment(group_id, user_id, float(amt or 0), desc)
-                    lines_msgs.append(f"✅ Платёж на сумму {amt}₽ зарегистрирован.")
+                    add_payment(group_id, payer_id, amt, desc)
+                    prefix = f"@{target_login}" if target_login else "Вы"
+                    lines_msgs.append(f"✅ {prefix}: платёж {amt:.0f}₽ зарегистрирован.")
                 except Exception as e:
-                    lines_msgs.append(f"Ошибка при сохранении платежа: {e}")
+                    lines_msgs.append(f"Ошибка при сохранении платежа на {amt:.0f}₽: {e}")
+
             await msg.answer("\n".join(lines_msgs))
         else:
-            await msg.answer("Не удалось распознать сумму платежа. Укажите, сколько и что вы оплатили.")
+            await msg.answer("Не удалось распознать сумму платежа. Укажите, сколько и кто заплатил. Пример: «Я заплатил 3000, @user — 4000».")
         return
 
     if intent == "help":
         await msg.answer(
             "Я могу помочь распределять расходы по чеку. Отправьте фото чека,\n"
-            "нажмите кнопку мини‑приложения для выбора позиций или воспользуйтесь текстовым вводом.\n"
+            "нажмите кнопку мини-приложения для выбора позиций или воспользуйтесь текстовым вводом.\n"
             "Доступные команды:\n"
             "/start — регистрация\n"
             "/show — показать позиции\n"
@@ -219,10 +251,8 @@ async def handle_nlu_message(msg: Message):
     if session_flags.get("await_choice"):
         lowered = text.lower()
         if "мини" in lowered:
-            # Если пользователь выбрал мини‑приложение, сообщаем как его открыть. Теперь можно
-            # воспользоваться командой /split, чтобы получить кнопку, даже если чек был загружен ранее.
             await msg.answer(
-                "Пожалуйста, нажмите команду /split или кнопку \U0001F4DD «Разделить чек» в сообщении бота, чтобы выбрать позиции в мини‑приложении.",
+                "Пожалуйста, нажмите команду /split или кнопку \U0001F4DD «Разделить чек» в сообщении бота, чтобы выбрать позиции в мини-приложении.",
                 reply_markup=ReplyKeyboardRemove(),
             )
         elif "текст" in lowered:
@@ -240,43 +270,54 @@ async def handle_nlu_message(msg: Message):
         session_flags["await_choice"] = False
         return
 
-    # --- Неизвестный запрос ---
-    # Прежде чем сообщить о незнакомом запросе, попробуем распознать в тексте информацию
-    # о платеже. Пользователи могут писать «я заплатил 300 рублей», и бот должен
-    # зарегистрировать этот платеж. Используем функцию extract_payment_from_text
-    # для поиска сумм в сообщении.
-    # Попробуем распознать сообщение как платёж. Чтобы избежать
-    # ложных срабатываний (например, когда пользователь пишет "купил 2 яблока"),
-    # проверяем наличие ключевых слов, связанных с оплатой (заплатил, оплатил,
-    # перевёл, потратил) или обозначений валюты (руб, р, ₽).
+    # --- Попытка распознать платёж в свободном тексте (fallback) ---
     payment_keywords = ["заплат", "оплат", "перевел", "перевёл", "потрат", "платеж", "платёж"]
     currency_markers = ["руб", "р", "₽"]
     lowered_text = text.lower()
-    should_try_payment = False
-    if any(k in lowered_text for k in payment_keywords) or any(c in lowered_text for c in currency_markers):
-        should_try_payment = True
+    should_try_payment = any(k in lowered_text for k in payment_keywords) or any(c in lowered_text for c in currency_markers)
+
     if should_try_payment:
         try:
             payments = await extract_payment_from_text(text)
         except Exception:
             payments = []
+
         if payments:
-            # Сохраняем каждый найденный платёж
             group_id = str(msg.chat.id)
-            user_id = msg.from_user.id
-            lines: list[str] = []
+            confirmations: list[str] = []
+
             for p in payments:
-                amt = p.get("amount")
+                amt = float(p.get("amount") or 0)
                 desc = p.get("description")
+                username = p.get("username")
+                is_self = bool(p.get("is_self"))
+
+                target_user_id: int | None = None
+                target_label: str = ""
+
+                if is_self or not username:
+                    target_user_id = msg.from_user.id
+                    me_info = get_user(target_user_id) or {}
+                    target_label = me_info.get("full_name") or me_info.get("phone") or "Вы"
+                else:
+                    target_user_id = _resolve_username_to_user_id(username)
+                    if target_user_id is None:
+                        confirmations.append(
+                            f"⚠️ Не нашёл пользователя {username} среди зарегистрированных. Пропустил платёж {amt}₽."
+                        )
+                        continue
+                    user_info = get_user(target_user_id) or {}
+                    target_label = user_info.get("full_name") or username
+
                 try:
-                    # Добавляем платеж в базу
-                    add_payment(group_id, user_id, float(amt or 0), desc)
-                    lines.append(f"✅ Платёж на сумму {amt}₽ зарегистрирован.")
+                    add_payment(group_id, target_user_id, amt, desc)
+                    confirmations.append(f"✅ Зарегистрирован платёж {amt}₽ от {target_label}.")
                 except Exception as e:
-                    lines.append(f"Ошибка при сохранении платежа: {e}")
-            await msg.answer("\n".join(lines))
+                    confirmations.append(f"Ошибка при сохранении платежа ({target_label}): {e}")
+
+            await msg.answer("\n".join(confirmations))
             return
-    # Если платежей не обнаружено — стандартный ответ
+
     await msg.answer(
         "Извините, я не понимаю. Напишите /help, чтобы узнать, что я умею."
     )

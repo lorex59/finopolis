@@ -16,14 +16,12 @@ from app.database import (
     set_positions,
     init_assignments,
     set_assignment,
-    get_assignments,
-    start_text_session,
-    append_text_message,
-    end_text_session,
     get_all_users,
     save_debts,
     save_selected_positions,
     get_selected_positions,
+    log_payment,
+    get_user
 )
 from keyboards import positions_keyboard
 from aiogram.fsm.context import FSMContext
@@ -33,8 +31,6 @@ from config import settings
 
 from utils import parse_position
 
-from app.database import get_user
-from app.database import get_all_users, save_debts, log_payment
 
 # Импортируем новые функции для платежей и расчёта баланса
 from app.database import (
@@ -117,32 +113,70 @@ async def cmd_split(msg: Message):
 @router.message(Command("show_position"))
 async def cmd_show_position(msg: Message):
     """
-    Отображает распределённые позиции для текущей группы. Использует
-    SELECTED_POSITIONS из database.py, где ключом является название
-    группы (chat.title). Если нет распределений, выводит соответствующее
-    сообщение.
+    Красивый форматированный вывод распределённых позиций по пользователям.
+
+    Формат строки:
+      Название — qty × price₽ - total₽
+    Если quantity == -1 (или < 0) — позицию делят поровну:
+      Название — поровну - price₽
     """
-    # Используем идентификатор группы. Для приватных чатов используем chat.id
     group_id = str(msg.chat.id)
     selections = get_selected_positions(group_id)
     if not selections:
-        await msg.answer("❗️Позиции ещё не распределены. Пользователи должны выбрать свои покупки через мини‑приложение.")
+        await msg.answer("❗️Позиции ещё не распределены. Откройте мини-приложение через /split и отметьте свои покупки.")
         return
+
+    def fmt_money(x: float | int | None) -> str:
+        try:
+            v = float(x or 0)
+            s = f"{v:.2f}".rstrip("0").rstrip(".")
+            return f"{s}₽"
+        except Exception:
+            return f"{x}₽" if x is not None else "—"
+
+    def fmt_qty(q: float | int | None) -> str:
+        try:
+            v = float(q or 0)
+            if abs(v - int(v)) < 1e-9:
+                return str(int(v))
+            # 1 знак после запятой, если хватает точности, иначе до 2-х
+            s = f"{v:.2f}".rstrip("0")
+            if s.endswith("."):
+                s = s[:-1]
+            return s
+        except Exception:
+            return str(q)
+
     lines: list[str] = ["<b>Распределение позиций:</b>"]
-    # Проходим по каждому пользователю и его выбору
-    for user_id, pos_list in selections.items():
-        # Определяем имя пользователя (ФИО, телефон или ID)
-        user_info = get_user(user_id) or {}
-        name = user_info.get('full_name') or user_info.get('phone') or str(user_id)
-        if pos_list:
-            # Формируем строку с перечислением позиций
-            items_str = ", ".join([
-                f"{p.get('name')} ({p.get('quantity')} × {p.get('price')}₽)"
-                for p in pos_list
-            ])
-        else:
-            items_str = "—"
-        lines.append(f"{name} ({user_id}): {items_str}")
+    # Чтобы вывод был стабильным – сортируем пользователей по ФИО/логину
+    for user_id in sorted(selections.keys(), key=lambda uid: (get_user(uid) or {}).get("full_name", str(uid))):
+        u = get_user(user_id) or {}
+        full_name = u.get("full_name") or f"ID {user_id}"
+        login = u.get("telegram_login")
+        login_part = f" (@{login})" if login and not str(login).startswith("@") else (f" ({login})" if login else "")
+        lines.append(f"<b>{full_name}{login_part}:</b>")
+
+        # список позиций данного пользователя
+        pos_list = selections.get(user_id) or []
+        if not pos_list:
+            lines.append("—")
+            continue
+
+        for p in pos_list:
+            name = p.get("name")
+            qty = p.get("quantity")
+            price = p.get("price")
+            try:
+                qv = float(qty) if qty is not None else 0.0
+            except Exception:
+                qv = 0.0
+            # «поровну»
+            if qv < 0 or qv == -1:
+                lines.append(f"{name} — поровну - {fmt_money(price)}")
+            else:
+                total = (float(price or 0) * float(qv or 0))
+                lines.append(f"{name} — {fmt_qty(qv)} × {fmt_money(price)} - {fmt_money(total)}")
+
     await msg.answer("\n".join(lines), parse_mode="HTML")
 
 
@@ -566,18 +600,19 @@ async def finalize_receipt(msg: Message):
     # начинается с -100), используем формат https://t.me/c/<id без -100>.
     group_link = ""
     try:
-        # При наличии username Telegram генерирует персонализированную ссылку
-        chat_username = getattr(msg.chat, 'username', None)
+        chat_username = getattr(msg.chat, "username", None)
         if chat_username:
             group_link = f"https://t.me/{chat_username}"
         else:
-            chat_id_str = str(msg.chat.id)
-            if chat_id_str.startswith("-100"):
-                group_link = f"https://t.me/c/{chat_id_str[4:]}"
-            elif chat_id_str.startswith("-"):
-                # Для обычных групп без username пробуем t.me/c/<abs(id)>
-                group_link = f"https://t.me/c/{chat_id_str[1:]}"
+            # create_chat_invite_link требует права администратора 'can_invite_users'
+            invite = await msg.bot.create_chat_invite_link(
+                chat_id=msg.chat.id,
+                name="Разделить чек",
+                creates_join_request=False
+            )
+            group_link = invite.invite_link or ""
     except Exception:
+        # Если прав нет — просто не добавляем ссылку (лучше, чем битая t.me/c/...)
         group_link = ""
     # Строим персональные сообщения для каждого участника. Собираем входящие и исходящие
     # переводы, чтобы пользователь видел, кому он должен и кто должен ему.

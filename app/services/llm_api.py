@@ -23,7 +23,7 @@ import os
 import io
 import base64
 import asyncio
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel, Field, RootModel
 
 from langchain_openai import ChatOpenAI
@@ -419,86 +419,146 @@ def _extract_items_from_text_regex(text: str) -> list[dict]:
 # --- Модели и промпт для извлечения платежей ---
 class Payment(BaseModel):
     amount: float = Field(description="Сумма платежа")
-    description: str = Field(description="Описание платежа")
-
+    description: str = Field(description="Короткое описание суммы (как в тексте)")
+    # ДОБАВЛЕНО: логин плательщика без '@'. Если плательщик — автор сообщения, поле опускается.
+    user_login: Optional[str] = Field(default=None, description="Username плательщика без '@', если указан в тексте")
 
 class PaymentList(RootModel[List[Payment]]):
     pass
 
-# LLM, настроенный на вывод структурированных платежей. Используем тот же
-# базовый llm, но с отдельной схемой. Включаем raw для доступа к метаданным.
 structured_llm_payments = llm.with_structured_output(
     PaymentList,
     include_raw=True
 )
 
-# Промпт для извлечения платежей из свободного текста. Модель должна
-# вернуть строго JSON‑массив объектов с полями amount (число) и
-# description (строка). Если платежей в тексте нет, массив должен быть
-# пуст. Сумма может быть указана в рублях, сопровождаться словами
-# "руб", "рублей", "р", символом "₽" или суффиксом "к"/"k" (тысяча).
+# Промпт уточнён: требуем user_login без '@' для упоминаний
 TEXT_PAYMENTS_PROMPT = (
-    "Ты — ассистент для разбора платежей из свободного текста.\n"
-    "Тебе нужно найти суммы, которые пользователь заплатил, и вернуть строго JSON‑массив объектов с полями amount (число) и description (строка).\n"
-    "Если в сообщении нет платежей, верни пустой массив.\n"
-    "Сумма может быть записана как число с разделителем точкой или запятой, а также иметь суффикс 'к' или 'k', означающий тысячи.\n"
-    "Допускаются слова 'руб', 'руб.', 'рублей', 'р', '₽' рядом с числом.\n"
-    "Пример: 'я заплатил 300 рублей и ещё 2к за напитки' → [{{\"amount\": 300, \"description\": '300 рублей'}}, {{\"amount\": 2000, \"description\": '2к'}}].\n"
-    "Не добавляй никаких комментариев, только JSON‑массив.\n"
+    "Ты ассистент для разбора платежей из свободного текста.\n"
+    "Найди все суммы, которые кто-либо заплатил, и верни строго JSON-массив объектов вида:\n"
+    "{{\"amount\": <число>, \"description\": <строка>, \"user_login\": <строка или null>}}\n"
+    "- Если плательщик указан через @username, заполни user_login БЕЗ символа '@' (пример: 'boris_anisov').\n"
+    "- Если плательщик — автор сообщения (слова 'я', 'я заплатил', без упоминания @username), поставь user_login=null.\n"
+    "- Суммы могут иметь запятую/точку и суффикс 'к'/'k' (= *1000). Допускай 'руб', 'руб.', 'рублей', 'р', '₽'.\n"
+    "- Верни ТОЛЬКО JSON-массив без комментариев.\n"
+    "Примеры:\n"
+    "  'Я заплатил 3000, @boris заплатил 4к' => "
+    "[{{\"amount\":3000,\"description\":\"я заплатил 3000\",\"user_login\":null}},"
+    " {{\"amount\":4000,\"description\":\"@boris заплатил 4к\",\"user_login\":\"boris\"}}]\n"
     "Текст: {text}"
 )
 
 async def extract_payment_from_text(text: str) -> list[dict]:
     """
-    Извлекает суммы платежей из свободного текста с помощью LLM. Если LLM
-    возвращает пустой список или недоступна, используется резервный
-    парсер на основе регулярных выражений. Возвращает список словарей
-    с полями `amount` (float) и `description` (исходная часть текста или
-    полное сообщение).
-
-    Args:
-        text: Текст сообщения пользователя.
-
-    Returns:
-        list[dict]: список объектов с полями `amount` и `description`.
+    Извлекает платежи из текста с помощью LLM; при неуспехе — fallback на regex.
+    Возвращает список словарей: {amount: float, description: str, user_login: Optional[str]}.
     """
     from langchain_core.messages import HumanMessage
-    # Попытка распознать платежи с помощью LLM
+
+    # 1) Пытаемся через LLM
     try:
         prompt = TEXT_PAYMENTS_PROMPT.format(text=text)
         msg = HumanMessage(content=prompt)
         ai_response = await structured_llm_payments.ainvoke([msg])
         payments_model: list[Payment] = ai_response["parsed"].root if ai_response else []
-        # Если LLM вернула платежи, конвертируем их в списки словарей
-        parsed_payments: list[dict] = []
+        parsed: list[dict] = []
         for p in payments_model:
             try:
-                parsed_payments.append({"amount": float(p.amount), "description": str(p.description)})
+                parsed.append({
+                    "amount": float(p.amount),
+                    "description": str(p.description),
+                    "user_login": (p.user_login or None)
+                })
             except Exception:
                 continue
-        if parsed_payments:
-            return parsed_payments
+        if parsed:
+            return parsed
     except Exception:
-        # Игнорируем ошибку LLM; fallback ниже обработает
+        # Игнорируем ошибку LLM — ниже fallback
         pass
-    # Fallback: регулярное выражение находит числа с необязательным суффиксом тысяч.
+
+    # 2) Fallback: регулярки
     import re
-    lowered = text.lower()
-    # Удаляем разделители тысяч (пробелы и неразрывные пробелы), чтобы корректно парсить
-    lowered = lowered.replace('\u00a0', ' ').replace('\u202f', ' ')
-    pattern = re.compile(r"(\d+[\.,]?\d*)\s*(к|k)?")
-    payments: list[dict] = []
-    for match in pattern.finditer(lowered):
-        amt_str = match.group(1) or "0"
-        suffix = match.group(2)
+
+    original = text.strip()
+    lowered = original.lower()
+
+    # нормализуем неразрывные пробелы/тонкие пробелы
+    norm = lowered.replace("\u00a0", " ").replace("\u202f", " ")
+
+    # Помощники
+    def _to_amount(num_str: str, suffix: str | None) -> float:
+        # Удаляем разделители тысяч внутри числа: "3 000", "3,000"
+        cleaned = re.sub(r"[ \u00a0\u202f]", "", num_str)
+        cleaned = cleaned.replace(",", ".")
         try:
-            amt = float(amt_str.replace(',', '.'))
+            val = float(cleaned)
         except Exception:
-            continue
+            return 0.0
         if suffix:
-            amt *= 1000
+            val *= 1000.0
+        return round(val, 2)
+
+    payments: list[dict] = []
+
+    # A) Паттерн: @username ... <amount>(k|к)?
+    # до 30 нецифровых символов между ником и суммой (чтобы покрыть "заплатил", "—", и т.п.)
+    pat_user_then_amt = re.compile(
+        r"@(?P<login>[a-zA-Z0-9_]{3,})[^\d]{0,30}?(?P<num>\d{1,3}(?:[ \u00a0\u202f]?\d{3})*(?:[.,]\d+)?)\s*(?P<suf>[кk])?",
+        re.IGNORECASE
+    )
+
+    used_spans: list[tuple[int, int]] = []
+    for m in pat_user_then_amt.finditer(norm):
+        login = m.group("login")
+        amt = _to_amount(m.group("num"), m.group("suf"))
+        if amt <= 0:
+            continue
         payments.append({
-            "amount": round(amt, 2),
-            "description": text.strip(),
+            "amount": amt,
+            "description": original[m.start():m.end()],
+            "user_login": login.lower()
         })
+        used_spans.append((m.start(), m.end()))
+
+    # B) Паттерн: упоминание автора: "я заплатил ... <amount>"
+    pat_me_amt = re.compile(
+        r"\bя[^\d]{0,30}?(?:заплатил[аи]?|оплатил[аи]?|перевел|перевёл|потратил[аи]?)?[^\d]{0,30}?"
+        r"(?P<num>\d{1,3}(?:[ \u00a0\u202f]?\d{3})*(?:[.,]\d+)?)\s*(?P<suf>[кk])?",
+        re.IGNORECASE
+    )
+    for m in pat_me_amt.finditer(norm):
+        # пропускаем, если пересекается с уже извлечённым фрагментом
+        if any(not (m.end() <= s or m.start() >= e) for s, e in used_spans):
+            continue
+        amt = _to_amount(m.group("num"), m.group("suf"))
+        if amt <= 0:
+            continue
+        payments.append({
+            "amount": amt,
+            "description": original[m.start():m.end()],
+            "user_login": None
+        })
+        used_spans.append((m.start(), m.end()))
+
+    # C) Общее: суммы без явного плательщика (считаем автором),
+    # но только если в тексте есть явные слова про оплату/деньги.
+    pay_markers = ("заплат", "оплат", "перевел", "перевёл", "потрат", "платеж", "платёж", "₽", " руб", " р ")
+    if any(k in norm for k in pay_markers):
+        pat_any_amt = re.compile(
+            r"(?P<num>\d{1,3}(?:[ \u00a0\u202f]?\d{3})*(?:[.,]\d+)?)\s*(?P<suf>[кk])?",
+            re.IGNORECASE
+        )
+        for m in pat_any_amt.finditer(norm):
+            if any(not (m.end() <= s or m.start() >= e) for s, e in used_spans):
+                continue
+            amt = _to_amount(m.group("num"), m.group("suf"))
+            if amt <= 0:
+                continue
+            payments.append({
+                "amount": amt,
+                "description": original[m.start():m.end()],
+                "user_login": None
+            })
+            used_spans.append((m.start(), m.end()))
+
     return payments
