@@ -55,6 +55,12 @@ async def process_bank(msg: Message, state: FSMContext):
     data = await state.get_data()        # получаем все данные из FSM
     user_id = msg.from_user.id
 
+    telegram_login = msg.from_user.username
+    data.update({
+        "bank": msg.text,
+        "telegram_login": telegram_login
+    })
+
     # Проверка: если уже есть — не сохраняем дубликат
     if get_user(user_id) is None:
         # Данные из FSM + последний выбор банка
@@ -75,11 +81,12 @@ async def cmd_show_users(msg: Message):
     text = "<b>Зарегистрированные пользователи:</b>\n"
     print(users)
     for user_id, user in users:
-        text += (
-            f"\nID: <code>{user_id}</code>\n"
-            f"👤 {user.get('full_name','?')}\n"
-            f"📱 {user.get('phone','?')}\n"
-            f"🏦 {user.get('bank','?')}\n"
-            "---"
-        )
+       text += (
+        f"\nID: <code>{user_id}</code>\n"
+        f"👤 {user.get('full_name','?')}\n"
+        f"💬 @{user.get('telegram_login','?')}\n"
+        f"📱 {user.get('phone','?')}\n"
+        f"🏦 {user.get('bank','?')}\n"
+        "---"
+    )
     await msg.answer(text, parse_mode="HTML")
