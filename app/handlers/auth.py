@@ -67,7 +67,7 @@ async def process_bank(msg: Message, state: FSMContext):
         data.update({"bank": msg.text})
         save_user(user_id, data)
 
-    await msg.answer("✅ Регистрация завершена!", reply_markup=ReplyKeyboardRemove())
+    await msg.answer("✅ Регистрация завершена! Для того чтобы мной воспользоваться необходимо создать группу, добавить меня и сделать администратором. После этого можете отправлять мне чеки.", reply_markup=ReplyKeyboardRemove())
     await state.clear()
 
 
